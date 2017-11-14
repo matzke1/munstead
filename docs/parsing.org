@@ -1,0 +1,108 @@
+* How to parse entities in a file
+
+  Parts of a container are parsed with these steps:
+
+  1. Create an empty instance of the object using its default
+     constructor.
+
+     auto symbol = new ElfSymbol!64
+
+  2. Perform any pre-parsing setup that's necessary. For instance,
+     the top-level file parsers need to have a memory map containing
+     the data they're expecting to parse. Most objects don't need any
+     particular setup.
+
+  3. Attach the empty object to the AST. This will allow it to find
+     anything else it needs during the parsing step by traversing the
+     AST, such as to find out whether it's in a big- or little-endian
+     encoded file.
+
+     symbolTable.entries.pushBack(symbol);
+
+  4. Every parsable object has a top-level "parse" method which often
+     invokes methods to perform the smaller steps. They always take
+     one argument, a ParseLocation, described under error reporting.
+
+* Error reporting during parsing
+*** Parser location chains
+    The construction of the AST doesn't always exactly match the calls
+    through the parser. For instance ElfSection objects are created by
+    parsing an entry in the ELF Section Table, but they don't appear as
+    children of ElfSectionTableEntry nodes. Instead, they're children of
+    the ElfFileHeader node because the same ElfSection might be created
+    by both the section table and the segment (program header) table.
+
+    Also, an error when parsing a string from a string table should
+    be able to trace back through the part of the parser that requested
+    the string rather than the part of the parser that created the
+    string table section.  In other words, a symbol having a bad name
+    pointer should given an error something like this:
+
+	error: invalid string offset 0xdeadbeef
+	info: in ELF32 string table /bin/cat ".dynstr" (va=0xxxxx, file=0xxxxx)
+	info: from ELF32 symbol #1
+	info: from ELF32 symbol table /bin/cat ".dynsym" (va=0xxxxx, file=0xxxxx)
+	info: from ELF32 file header /bin/cat (file=0xxxxx)
+
+    rather than information about where the string table was constructed
+    (i.e., constructed from parsing the file header):
+
+	error: invalid string offset 0xdeadbeef
+	info: in ELF32 string table /bin/cat ".dynstr" (va=0xxxxx, file=0xxxxx)
+	info: from ELF32 file header /bin/cat (file=0xxxxx) 
+
+    To that end, parsers pass each other ParseLocation chains. The
+    top-level parsser creates a ParseLocation object (they're typically
+    named "loc"), then passes it to all parsers which it calls. Each of
+    those parsers in turn creates a new ParseLocation object which links
+    to the one that got passed in. Linking them in this way means that
+    if a parser throws an exception we don't need to worry about
+    removing stale entries from the list.
+
+*** Creating an error
+    Every error will consist of an error message and a pointer to an
+    optional (but recommended) parse location chain.  All
+    ParseLocation objects in the chain are immutable in that they do
+    not provide an API for modifying their immediate members. However,
+    note that we don't use the "immutable" qualifier because that
+    would mean that anything they point to, such as memory maps, would
+    need to be immutable, which would be very inconvenient.
+
+    An error is any class that inerits from
+    munstead.exception.MunsteadError, which in turn inherits from
+    object.Exception. The file name and line number for these
+    exceptions normally represent the location in the Munstead source
+    code where the error was created, and we rely on the parse
+    location chain to give information about where the error occurs in
+    the binary specimen.
+
+    Although errors are throwable, we don't want a relatively minor
+    parsing error to terminate the entire parse (that would be like a
+    compiler giving you only one error message per compilation)! On
+    the other hand, we don't want a bad parse at one level to cause
+    effectively an infinite loop at some other layer (e.g., a "number
+    of symbols" field that gets a wild value that then causes a
+    symbol-parsing "for" loop to execute an insane number of
+    times). Therefore, there's a multi-part mechanism for reporting
+    errors:
+
+    1. When an error is detected, it should be attached to the object
+       within which it was detected by using Ast.appendError.
+
+    2. If the appending causes some settable limit to be reached, then
+       an exception is thrown, that being the error which was just
+       added.
+
+    3. Some parsers may want to track how many errors occur in child
+       parsers and throw an exception when some limit is
+       reached. There is an API for querying the errors of any object.
+
+*** ParseLocation types
+    Different parts of parsing have to relay different kinds of
+    location information. Therefore, ParseLocation is the base of a
+    class hierarchy and each class knows how to convert itself to a
+    string using "to!string".
+
+    The string reprentation of a parser location does not include
+    prefixes like "error:", "info:", "in", or "from" -- just the
+    location.

@@ -1,3 +1,4 @@
+/** Key/value mapping for adjacent values. */
 module munstead.core.imap;
 
 import munstead.core.interval: Interval, inverseIntervals;
@@ -7,16 +8,22 @@ import std.range: array, empty, retro, take;
 import std.typecons: Tuple, tuple;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/** Defines how map values are split or joined. */
 class DefaultPolicy(Key, Value) {
-  // Split the value (associated with the key) into two values, the first associated with the part of the key less than
-  // pivot, and the second associated with the part of the key greater than or equal to the pivot.
+  /** How to split a value in two.
+   *
+   * Splits the value (associated with the key) into two values, the first associated with the part of the key less than
+   * pivot, and the second associated with the part of the key greater than or equal to the pivot. */
   static Tuple!(Value, Value) split(Interval!Key key, Value value, Key pivot) {
     assert(key.contains(pivot));
     return tuple(value, value);
   }
-    
-  // If possible, merge val1 (associated with key1) and val2 (associated with key2) to create one larger value
-  // associated with the union of key1 and key2.
+
+  /** How to join two adjacent values.
+   *
+   * If possible, merge val1 (associated with key1) and val2 (associated with key2) to create one larger value
+   * associated with the union of key1 and key2. */
   static Tuple!(bool, Value) merge(Interval!Key key1, Value val1, Interval!Key key2, Value val2) {
     assert(key1.leftAdjacent(key2));
     return val1 == val2 ? tuple(true, val1) : tuple(false, val1/*unimportant*/);
@@ -72,17 +79,27 @@ public:
 }
     
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-// Mapping from K to T.
+
+/** Maps values of type T to keys of type K.
+ *
+ *  An IntervalMap is different than an associative array in a number of ways:
+ *
+ *  $(LI The keys are sortable and key/value associations are stored in sorted order.)
+ *  $(LI The key type can be used to form closed intervals.)
+ *  $(LI Values of adjancent keys can potentially be combined automatically.)
+ *  $(LI Removing values from the middle of an interval will automatically split the interval.)
+ *  $(LI Access time complexity is on the order of the log of the number of maximal intervals.)
+ *  $(LI The intervals are accessible through the API even if values are added individually.) */
 class IntervalMap(K, V, Policy = DefaultPolicy!(K, V))
   : IntervalTree!(Tuple!(Interval!K, "interval",  V, "value"), "a.interval") {
 
-  alias Key = K;
-  alias Value = V;
-  alias Interval = munstead.core.interval.Interval!Key;
-  alias Node = Tuple!(Interval, "interval", Value, "value");
+  alias Key = K;                                             /** Type of keys. */
+  alias Value = V;                                           /** Type of values. */
+  alias Interval = munstead.core.interval.Interval!Key;      /** Closed interval of keys. */
+  alias Node = Tuple!(Interval, "interval", Value, "value"); /** Interval and value pair. */
 
 public:
-  // Insert into this set those values contained in the specified interval.
+  /** Insert into this set those values contained in the specified interval. */
   pure void insert(Interval interval, Value value) @safe {
     if (interval.empty)
       return;
@@ -97,12 +114,12 @@ public:
     insertTreeNodes(toInsert);
   }
 
-  // Insert into this set a single value.
+  /** Insert into this set a single value. */
   pure void insert(Interval.Value key, Value value) @safe {
     insert(Interval(key), value);
   }
 
-  // Remove from this map those values contained in the specified interval.
+  /** Remove from this map those values contained in the specified interval. */
   pure void remove(Interval interval) @safe {
     if (interval.empty)
       return;
@@ -118,54 +135,56 @@ public:
     insertTreeNodes(toInsert);
   }
 
-  // Remove from this set a single value
+  /** Remove from this set a single value. */
   pure void remove(Interval.Value key) @safe {
     remove(Interval(key));
   }
 
-  // Return the complement of this map, setting all elements to the specified value
+  /** Return the complement of this map, setting all elements to the specified value. */
   pure IntervalMap complement(Value value) const @safe {
     IntervalMap retval = new IntervalMap;
     retval.insertTreeNodes(nodes()
-			   .map!(node => node.interval)
-			   .inverseIntervals
-			   .map!(interval => Node(interval, value)));
+                           .map!(node => node.interval)
+                           .inverseIntervals
+                           .map!(interval => Node(interval, value)));
     return retval;
   }
 
+  /** True if the entire interval exists. */
   pure bool existsAll(Interval interval) const @safe {
     Value tmpval;
     return super.existsAll(Node(interval, tmpval));
   }
 
+  /** ditto */
   alias exists = existsAll;
 
-  // True if any of the specified values exist. False if the interval is empty.
+  /** True if any of the specified values exist. False if the interval is empty. */
   pure bool existsAny(Interval interval) const @safe {
     Value tmpval;
     return super.existsAny(Node(interval, tmpval));
   }
 
-  // Returns the intersection of the map and the specified interval as a range.
+  /** Returns the intersection of the map and the specified interval as a range. */
   auto intersect(Interval interval) {
     debug import std.stdio;
     Value tmpval;
     Node needle = Node(interval, tmpval);
     return overlapRange(needle).map!(delegate Node(Node node) {
-	if (node.interval.startsBefore(interval)) {
-	  Interval rightInterval = node.interval.greaterThanEqual(interval.least);
-	  Value rightValue = Policy.split(node.interval, node.value, interval.least)[1];
-	  node = Node(rightInterval, rightValue);
-	}
-	if (node.interval.endsAfter(interval)) {
-	  Interval leftInterval = node.interval.lessThanEqual(interval.greatest);
-	  Value leftValue = Policy.split(node.interval, node.value, leftInterval.grow.greatest)[0];
-	  node = Node(leftInterval, leftValue);
-	}
-	return node;
+        if (node.interval.startsBefore(interval)) {
+          Interval rightInterval = node.interval.greaterThanEqual(interval.least);
+          Value rightValue = Policy.split(node.interval, node.value, interval.least)[1];
+          node = Node(rightInterval, rightValue);
+        }
+        if (node.interval.endsAfter(interval)) {
+          Interval leftInterval = node.interval.lessThanEqual(interval.greatest);
+          Value leftValue = Policy.split(node.interval, node.value, leftInterval.grow.greatest)[0];
+          node = Node(leftInterval, leftValue);
+        }
+        return node;
       });
   }
-	  
+          
 private:
   // Range of nodes that overlap with some interval, prefixed by a left-adjacent node (if any) and suffixed by a
   // right-adjacent node (if any).
@@ -185,23 +204,23 @@ private:
       return retval;
     foreach (node; overlaps) {
       if (node.interval.startsBefore(exclude)) {
-	assert(retval.length == 0);
-	if (node.interval.overlaps(exclude)) {
-	  Interval leftInterval = node.interval.lessThan(exclude.least);
-	  Value leftValue = Policy.split(node.interval, node.value, exclude.least)[0];
-	  retval ~= [ Node(leftInterval, leftValue) ];
-	} else {
-	  retval ~= [ node ];
-	}
+        assert(retval.length == 0);
+        if (node.interval.overlaps(exclude)) {
+          Interval leftInterval = node.interval.lessThan(exclude.least);
+          Value leftValue = Policy.split(node.interval, node.value, exclude.least)[0];
+          retval ~= [ Node(leftInterval, leftValue) ];
+        } else {
+          retval ~= [ node ];
+        }
       }
       if (node.interval.endsAfter(exclude)) {
-	if (node.interval.overlaps(exclude)) {
-	  Interval rightInterval = node.interval.greaterThan(exclude.greatest);
-	  Value rightValue = Policy.split(node.interval, node.value, rightInterval.least)[1];
-	  retval ~= [ Node(rightInterval, rightValue) ];
-	} else {
-	  retval ~= [ node ];
-	}
+        if (node.interval.overlaps(exclude)) {
+          Interval rightInterval = node.interval.greaterThan(exclude.greatest);
+          Value rightValue = Policy.split(node.interval, node.value, rightInterval.least)[1];
+          retval ~= [ Node(rightInterval, rightValue) ];
+        } else {
+          retval ~= [ node ];
+        }
       }
     }
     return retval;
@@ -213,16 +232,16 @@ private:
     Node[] retval;
     foreach (node; nodes) {
       if (retval.empty) {
-	retval = [ node ];
+        retval = [ node ];
       } else if (retval[$-1].interval.leftAdjacent(node.interval)) {
-	auto merged = Policy.merge(retval[$-1].interval, retval[$-1].value, node.interval, node.value);
-	if (merged[0]) {
-	  retval[$-1] = Node(Interval.hull(retval[$-1].interval, node.interval), merged[1]);
-	} else {
-	  retval ~= [ node ];
-	}
+        auto merged = Policy.merge(retval[$-1].interval, retval[$-1].value, node.interval, node.value);
+        if (merged[0]) {
+          retval[$-1] = Node(Interval.hull(retval[$-1].interval, node.interval), merged[1]);
+        } else {
+          retval ~= [ node ];
+        }
       } else {
-	retval ~= [ node ];
+        retval ~= [ node ];
       }
     }
     return retval;
@@ -230,6 +249,13 @@ private:
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+unittest {} // to prevent the following test from being documented
+
+unittest {
+  import std.stdio;
+  writeln("unit tests: ", __FILE__);
+}
+
 //-------- constructors --------
 pure @safe unittest {
   const map = new IntervalMap!(int, string);
@@ -249,7 +275,7 @@ pure @safe unittest {
   assert(cmap.empty);
 
   // insert a singleton
-  map.insert(-5, "a");		// {-5 "a"}
+  map.insert(-5, "a");          // {-5 "a"}
   assert(!cmap.empty);
   assert(cmap.length == 1);
   assert(cmap.nIntervals == 1);
@@ -270,13 +296,13 @@ pure @safe unittest {
   assert(cmap.hull == map.Interval.hull(-5, 4));
 
   // insert a range that joins to the left
-  map.insert(-4, "a");		//  {[-5,-4] "a", [0,3] "c", 4 "b"}
+  map.insert(-4, "a");          //  {[-5,-4] "a", [0,3] "c", 4 "b"}
   assert(cmap.length == 7);
   assert(cmap.nIntervals == 3);
   assert(cmap.hull == map.Interval.hull(-5, 4));
 
   // set [4] to "c", causing it to join to the left
-  map.insert(4, "c");		// {[-5,-4] "a", [0,4] "c"}
+  map.insert(4, "c");           // {[-5,-4] "a", [0,4] "c"}
   assert(cmap.length == 7);
   assert(cmap.nIntervals == 2);
   assert(cmap.hull == map.Interval.hull(-5, 4));
@@ -298,7 +324,7 @@ pure @safe unittest {
   assert(cmap.nIntervals == 1);
   assert(cmap.hull == map.Interval.hull(-5, 4));
 
-  map.clear();			// {}
+  map.clear();                  // {}
   assert(cmap.empty);
   assert(cmap.length == 0);
   assert(cmap.nIntervals == 0);
@@ -315,7 +341,7 @@ pure @safe unittest {
   assert(cmap.hull == map.Interval.hull(-5, 4));
 
   // remove nothing
-  map.remove(map.Interval());	// {[-5,4] "A"}
+  map.remove(map.Interval());   // {[-5,4] "A"}
   assert(cmap.length == 10);
   assert(cmap.nIntervals == 1);
   assert(cmap.hull == map.Interval.hull(-5, 4));
@@ -327,7 +353,7 @@ pure @safe unittest {
   assert(cmap.hull == map.Interval.hull(-5, 4));
 
   // remove from the left
-  map.remove(-5);		// {-4 "A", [0,4] "A"}
+  map.remove(-5);               // {-4 "A", [0,4] "A"}
   assert(cmap.length == 6);
   assert(cmap.nIntervals == 2);
   assert(cmap.hull == map.Interval.hull(-4, 4));
@@ -339,7 +365,7 @@ pure @safe unittest {
   assert(cmap.hull == map.Interval.hull(-4, 3));
 
   // remove from the from middle again
-  map.remove(2); 		// {-4 "A", [0,1] "A", 3 "A"}
+  map.remove(2);                // {-4 "A", [0,1] "A", 3 "A"}
   assert(cmap.length == 4);
   assert(cmap.nIntervals == 3);
   assert(cmap.hull == map.Interval.hull(-4, 3));
@@ -371,17 +397,17 @@ pure @safe unittest {
   assert(cmap.nIntervals == 1);
   assert(cmap.hull == map.Interval.whole());
 
-  map.remove(-127);		// {-128, [-126,127]}
+  map.remove(-127);             // {-128, [-126,127]}
   assert(cmap.length == 255);
   assert(cmap.nIntervals == 2);
   assert(cmap.hull == map.Interval.whole());
 
-  map.remove(-128); 		// {[-126,127]}
+  map.remove(-128);             // {[-126,127]}
   assert(cmap.length == 254);
   assert(cmap.nIntervals == 1);
   assert(cmap.hull == map.Interval.hull(-126, 127));
 
-  map.remove(127); 		// {[-126,126]}
+  map.remove(127);              // {[-126,126]}
   assert(cmap.length == 253);
   assert(cmap.nIntervals == 1);
   assert(cmap.hull == map.Interval.hull(-126, 126));

@@ -56,8 +56,8 @@ if (isArray!T) {
     } else {
       // Large arrays (or small arrays of non-basic type) are printed vertically
       for (size_t i = 0; i < value.length; ++i) {
-	auto subfmt = fmt.indent(i);
-	tabulate(value[i], subfmt);
+        auto subfmt = fmt.indent(i);
+        tabulate(value[i], subfmt);
       }
     }
   }
@@ -73,9 +73,9 @@ if (isAggregateType!T) {
     } else {
       import munstead.ast.sections: AsmSection;
       static if (is(Node nBits : AsmSection!nBits)) {
-	writefln("%-*s %s(\"%s\")", subfmt.nameWidth, subfmt.prefix, typeid(node), node.name);
+        writefln("%-*s %s(\"%s\")", subfmt.nameWidth, subfmt.prefix, typeid(node), node.name);
       } else {
-	writefln("%-*s %s", subfmt.nameWidth, subfmt.prefix, Node.stringof);
+        writefln("%-*s %s", subfmt.nameWidth, subfmt.prefix, Node.stringof);
       }
     }
   }
@@ -86,7 +86,7 @@ if (isAggregateType!T) {
       return;
     }
   }
-  
+
   foreach (member; __traits(allMembers, typeof(value))) {
     static if (!is(typeof(__traits(getMember, value, member)))) {
       // not a member with a type (e.g., it might be an alias for a type)
@@ -94,14 +94,16 @@ if (isAggregateType!T) {
       // don't print implementation details
     } else static if (__traits(getProtection, __traits(getMember, value, member)) != "public") {
       // only print public things
-    } else static if (hasUDA!(__traits(getMember, value, member), _AstChildAccessor)) {
+    } else static if (is(typeof(hasUDA!(__traits(getMember, value, member), _AstChildAccessor))) &&
+                      hasUDA!(__traits(getMember, value, member), _AstChildAccessor)) {
       // show one-line info for child pointers?
       if (!fmt.skipChildren) {
-	auto child = __traits(getMember, value, member);
-	auto subfmt = fmt.indent(member);
-	oneLine(child, subfmt);
+        auto child = __traits(getMember, value, member);
+        auto subfmt = fmt.indent(member);
+        oneLine(child, subfmt);
       }
-    } else static if (hasUDA!(__traits(getMember, value, member), _AstChildMutator)) {
+    } else static if (is(typeof(hasUDA!(__traits(getMember, value, member), _AstChildMutator))) &&
+                      hasUDA!(__traits(getMember, value, member), _AstChildMutator)) {
       // don't call child mutators
     } else static if (is(typeof(__traits(getMember, value, member)) : Ast) && member != "parent") {
       // don't follow non-child AST pointers, but print some basic info
@@ -109,26 +111,27 @@ if (isAggregateType!T) {
       oneLine(__traits(getMember, value, member), subfmt);
     } else static if (!is(typeof(__traits(getMember, value, member)))) {
       // member is not accessible (needs to be before some std.traits such as isFunction)
-    } else static if (isFunction!(__traits(getMember, value, member))) {
+    } else static if (is(typeof(isFunction!(__traits(getMember, value, member)))) &&
+                      isFunction!(__traits(getMember, value, member))) {
       // member is a function
     } else {
       auto subfmt = fmt.indent(member);
       static if (is(typeof(__traits(getMember, value, member)) == class)) {
-	if (__traits(getMember, value, member) is null) {
-	  // class data member null pointer
-	  writefln("%-*s <null>", subfmt.nameWidth, subfmt.prefix);
-	  return;
-	}
+        if (__traits(getMember, value, member) is null) {
+          // class data member null pointer
+          writefln("%-*s <null>", subfmt.nameWidth, subfmt.prefix);
+          return;
+        }
       }
 
       static if (is(typeof(__traits(getMember, value, member).tabulate(subfmt)))) {
-	// data member with "tabulate" method
-	__traits(getMember, value, member).tabulate(subfmt);
+        // data member with "tabulate" method
+        __traits(getMember, value, member).tabulate(subfmt);
       } else static if (is(typeof(tabulate(__traits(getMember, value, member), subfmt)))) {
-	// "tabulate" function invoked with data member as argument
-	tabulate(__traits(getMember, value, member), subfmt);
+        // "tabulate" function invoked with data member as argument
+        tabulate(__traits(getMember, value, member), subfmt);
       } else static if (is(typeof(to!string(__traits(getMember, value, member))))) {
-	writefln("%-*s %s", subfmt.nameWidth, subfmt.prefix, to!string(__traits(getMember, value, member)));
+        writefln("%-*s %s", subfmt.nameWidth, subfmt.prefix, to!string(__traits(getMember, value, member)));
       }
     }
   }

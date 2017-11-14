@@ -79,7 +79,7 @@ public:
       return false;
     foreach (node; overlaps) {
       if (interval_(node).least > interval.least)
-	return false;
+        return false;
       interval = interval.greaterThan(interval_(node).greatest);
     }
     return interval.empty;
@@ -96,16 +96,16 @@ protected:
   pure overlapRange(Node needle) @safe {
     Interval needleInterval = interval_(needle);
     return chain(tree_.lowerBound(needle).retro.until!(a => interval_(a).disjoint(needleInterval)), // 0 or 1 element
-		 tree_.equalRange(needle), // 0 or 1 element
-		 tree_.upperBound(needle).until!(a => interval_(a).disjoint(needleInterval)) // 0 or more elements
-		 );
+                 tree_.equalRange(needle), // 0 or 1 element
+                 tree_.upperBound(needle).until!(a => interval_(a).disjoint(needleInterval)) // 0 or more elements
+                 );
   }
   pure overlapRange(Node needle) const @safe { // FIXME: use inout instead of copy-paste
     Interval needleInterval = interval_(needle);
     return chain(tree_.lowerBound(needle).retro.until!(a => interval_(a).disjoint(needleInterval)), // 0 or 1 element
-		 tree_.equalRange(needle), // 0 or 1 element
-		 tree_.upperBound(needle).until!(a => interval_(a).disjoint(needleInterval)) // 0 or more elements
-		 );
+                 tree_.equalRange(needle), // 0 or 1 element
+                 tree_.upperBound(needle).until!(a => interval_(a).disjoint(needleInterval)) // 0 or more elements
+                 );
   }
 
   // Adjust the count of the number of elements in this set. It is assumed that the supplied range of intervals are
@@ -115,13 +115,13 @@ protected:
     foreach (node; range) {
       assert(!interval_(node).empty);
       if (interval_(node) == Interval.whole() && Interval.Value.sizeof == size_t.sizeof) {
-	nElmts_ = 0;
+        nElmts_ = 0;
       } else {
-	static if (op == "+") {
-	  nElmts_ += interval_(node).length;
-	} else {
-	  nElmts_ -= interval_(node).length;
-	}
+        static if (op == "+") {
+          nElmts_ += interval_(node).length;
+        } else {
+          nElmts_ -= interval_(node).length;
+        }
       }
     }
   }

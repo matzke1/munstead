@@ -2,13 +2,15 @@ module munstead.elf.notes;
 
 import munstead.ast.base;
 import munstead.core.byteorder;
+import munstead.core.exception;
 import munstead.core.interval;
 import munstead.core.mmap;
 import munstead.core.wordtypes;
-import munstead.core.util: alignUp;
+import munstead.core.util;
 import munstead.elf.files;
 import munstead.elf.sections;
 import munstead.elf.segments;
+import munstead.elf.strings;
 import munstead.elf.types;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -22,33 +24,20 @@ class ElfNoteSection(size_t nBits): ElfSection!nBits {
     entries = new AstList!(ElfNote!nBits);
   }
 
-  static ElfNoteSection
-  parse(MemoryMap)(MemoryMap file, ElfFileHeader!nBits fhdr, ElfSectionTableEntry!nBits shent) {
-    assert(shent !is null);
-    auto ret = new ElfNoteSection;
-    ret.initFromSectionTableEntry(file, shent);
-    ret.parse(fhdr);
-    return ret;
-  }
+  void parse(ParseLocation parentLoc) {
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
+    assert(fhdr !is null);
 
-  static ElfNoteSection
-  parse(MemoryMap)(MemoryMap file, ElfFileHeader!nBits fhdr, ElfSegmentTableEntry!nBits phent) {
-    assert(phent !is null);
-    auto ret = new ElfNoteSection;
-    ret.initFromSegmentTableEntry(file, phent);
-    ret.parse(fhdr);
-    return ret;
-  }
+    auto tableLoc = sectionLocation(fhdr.formatName ~ " notes section", 0, parentLoc);
 
-  void
-  parse(ElfFileHeader!nBits fhdr) {
-    size_t index = 0;
+    size_t tableSize = bytes.hull.length;
     Word!nBits offset = 0;
-    while (offset < mmap.length) {
-      auto note = ElfNote!nBits.parse(this, offset, fhdr.byteOrder);
-      note.index = index++;
-      entries.pushBack(note);
-      offset += note.location.length;
+    for (size_t idx = 0; offset < tableSize; ++idx) {
+      auto entryLoc = indexParseLocation(fhdr.formatName ~ " note", idx, tableLoc);
+      auto entry = ElfNote!nBits.instance();
+      entries.pushBack(entry);
+      entry.parse(entryLoc);
+      offset += entry.location.length;
     }
   }
 }
@@ -72,36 +61,41 @@ class ElfNote(size_t nBits): Ast {
 
   Interval!Address location; // location of this entire note within the containing notes section
   size_t index; // index of this note within the containing notes section
-  Disk hdr;
+  Disk disk;
   string name;
   Interval!Address descLocation; // location of desc field (no padding) w.r.t. containing notes section
   ubyte[] desc;
 
-  static ElfNote
-  parse(ElfNoteSection!nBits notes, Word!nBits offset, ByteOrder byteOrder) {
-    // Parse header
-    auto ret = new ElfNote;
-    notes.mmap.readObjectAt(offset, ret.hdr);
-    ret.hdr = toNative(ret.hdr, byteOrder);
-    ret.location = Interval!Address.baseSize(offset, Disk.sizeof); // name and desc are added later
+  void parse(ParseLocation parentLoc) {
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
+    assert(fhdr !is null);
+    auto table = ancestor!(ElfNoteSection!nBits);
+    assert(table !is null);
+
+    index = table.entries.length - 1;
+    assert(table.entries[index] is this);
+    Word!nBits start = index > 0 ? table.entries[index-1].location.greatest + 1 : 0;
+    auto loc = table.sectionLocation(fhdr.formatName ~ " note", start, parentLoc);
+   
+    table.bytes.readObjectAt(start, disk);
+    disk = disk.toNative(fhdr.byteOrder);
+    location = Interval!Address.baseSizeTrunc(start, Disk.sizeof); // name and desc are added later
 
     // Parse name
-    if (ret.hdr.namesz > 0) {
-      Word!nBits nameOffset = ret.location.greatest + 1;
-      Address nameAlignedSize = alignUp(ret.hdr.namesz, 4); // 4-byte padding regardless of word size
-      ret.name = notes.stringAt(nameOffset, ret.hdr.namesz);
-      ret.location = Interval!Address.hull(ret.location.least, ret.location.greatest + nameAlignedSize);
+    if (disk.namesz > 0) {
+      Word!nBits nameOffset = location.greatest + 1;
+      Address nameAlignedSize = alignUp(disk.namesz, 4); // 4-byte padding regardless of word size
+      name = table.bytes.stringAt(nameOffset, this, loc, disk.namesz);
+      location = Interval!Address.hull(location.least, location.greatest + nameAlignedSize);
     }
 
     // Parse desc
-    if (ret.hdr.descsz > 0) {
-      Address descOffset = ret.location.greatest + 1;
-      Address descAlignedSize = alignUp(ret.hdr.descsz, 4); // 4-byte padding regardless of word size
-      ret.descLocation = Interval!Address.baseSize(descOffset, ret.hdr.descsz);
-      ret.location = Interval!Address.hull(ret.location.least, ret.location.greatest + descAlignedSize);
-      ret.desc = notes.mmap.segmentsWithin(ret.descLocation).byBuffer(ret.descLocation.length).front.buffer;
+    if (disk.descsz > 0) {
+      Address descOffset = location.greatest + 1;
+      Address descAlignedSize = alignUp(disk.descsz, 4); // 4-byte padding regardless of word size
+      descLocation = Interval!Address.baseSizeTrunc(descOffset, disk.descsz);
+      location = Interval!Address.hull(location.least, location.greatest + descAlignedSize);
+      desc = table.bytes.segmentsWithin(descLocation).byBuffer(descLocation.length).front.buffer;
     }
-
-    return ret;
   }
 }

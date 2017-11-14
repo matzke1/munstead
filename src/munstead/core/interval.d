@@ -1,40 +1,43 @@
+/** Closed intervals of integral types. */
 module munstead.core.interval;
 
 import core.exception;
-import std.algorithm: min, max, minElement, maxElement;
+import std.algorithm: filter, min, map, max, minElement, maxElement;
 import std.array;
 import std.range.primitives: ElementType, isForwardRange, isInputRange;
+import std.traits: Signed;
 import std.typecons;
 
-// Contiguous ranges of values of type T.
-//
-// Unlike most other implementations, this one can represent intervals that include T.max.
+/** Contiguous ranges of values of type T.
+ *
+ *  Unlike most other implementations, this one can represent intervals that include T.max. */
 struct Interval(T) if (T.sizeof <= size_t.sizeof) {
 public:
   alias Value = T;
 
 private:
-  Value lo_ = 1;		// low value, inclusive
-  Value hi_ = 0;		// high value, inclusive. lo_==1 && hi_==0 implies empty
+  Value lo_ = 1;                // low value, inclusive
+  Value hi_ = 0;                // high value, inclusive. lo_==1 && hi_==0 implies empty
 
   invariant {
     assert(lo_ <= hi_ || (lo_==1 && hi_==0));
   }
 
 public:
-  // Constructs an empty interval.
+  /** Constructs an empty interval. */
   static Interval opCall() {
     Interval retval;
     return retval;
   }
 
-  // Constructs a singleton interval.
+  /** Constructs a singleton interval. */
   static Interval opCall(Value v) {
     Interval retval;
     retval.lo_ = retval.hi_ = v;
     return retval;
   }
 
+  /** Construct an interval from another type. */
   static Interval from(S)(Interval!S other) {
     Interval retval;
     if (!other.empty) {
@@ -47,7 +50,7 @@ public:
   // Intentionally omitted:
   // static Interval opCall(Value a, Value b) -- is b the max value, max+1, or a size?!? Use hull or baseSize instead.
 
-  // Construct an interval from two endpoints given in either order
+  /** Construct an interval from two endpoints given in either order. */
   static Interval hull(Value v1, Value[] values...) {
     Interval retval;
     retval.lo_ = minElement([v1] ~ values);
@@ -55,17 +58,17 @@ public:
     return retval;
   }
 
-  // Constructs the minimum interval that spans all specified intervals.
+  /** Constructs the minimum interval that spans all specified intervals. */
   static Interval hull(Interval i1, Interval[] intervals...) {
     Interval retval;
     foreach (interval; [i1] ~ intervals) {
       if (!interval.empty) {
-	if (retval.empty) {
-	  retval = interval;
-	} else {
-	  retval.lo_ = min(retval.lo_, interval.lo_);
-	  retval.hi_ = max(retval.hi_, interval.hi_);
-	}
+        if (retval.empty) {
+          retval = interval;
+        } else {
+          retval.lo_ = min(retval.lo_, interval.lo_);
+          retval.hi_ = max(retval.hi_, interval.hi_);
+        }
       }
     }
     return retval;
@@ -76,7 +79,7 @@ public:
     return Interval();
   }
 
-  // Construct an interval containing all possible values.
+  /** Construct an interval containing all possible values. */
   static Interval whole() {
     Interval retval;
     retval.lo_ = Value.min;
@@ -84,34 +87,65 @@ public:
     return retval;
   }
 
-  // Construct an interval from a lo value and a size.  Try to avoid using this factory because it has some diesign
-  // issues that will eventually bite you:
-  //
-  //   (1) If size is zero, then lo is ignored.
-  //   (2) size_t may be too small to represent all values, such as Interval!ulong.hull
-  //   (3) lo + size - 1 might be larger than Value.max
-  //   (4) overflow might not result in an exception--the Interval will be valid, just wrong
-  //
-  // Nonetheless, this method is provided because it can be useful in situations where the caller asserts that none of
-  // these edge cases are possible.
+  private static bool baseSizeOverflows(Value lo, size_t size) {
+    size_t maxSize = cast(size_t) Value.max - cast(size_t) lo;
+    return size > maxSize;
+  }
+
+  /** Construct an interval from a lo value and a size.
+   *
+   *  Try to avoid using this factory because it has some diesign issues that will eventually bite you:
+   *
+   *  $(LI If size is zero, then lo is ignored.)
+   *  $(LI size_t may be too small to represent all values, such as Interval!ulong.hull)
+   *  $(LI lo + size - 1 might be larger than Value.max)
+   *  $(LI overflow might not result in an exception--the Interval will be valid, just wrong.)
+   *
+   * Nonetheless, this method is provided because it can be useful in situations where the caller asserts that none of
+   * these edge cases are possible. */
   static Interval baseSize(Value lo, size_t size) {
     Interval retval;
     if (0 == size)
       return retval;
-    Value hi = cast(Value)(lo + size - 1);
-    if (hi < lo)
+    if (baseSizeOverflows(lo, size))
       throw new RangeError;
     retval.lo_ = lo;
-    retval.hi_ = hi;
+    retval.hi_ = cast(Value)(lo + size - 1);
     return retval;
   }
 
-  // True if this interval is empty.
+  // FIXME: [Robb Matzke, 2017-10-15]: This should be named "Clip" not "Trunc", for consistency.
+
+  /** Construct an interval from a lo value and a size.
+   *
+   *  Try to avoid using this factory because it has some diesign issues that will eventually bite you:
+   *
+   *  $(LI If size is zero, then lo is ignored.)
+   *  $(LI size_t may be too small to represent all values, such as Interval!ulong.hull)
+   *  $(LI lo + size - 1 might be larger than Value.max, in which case the interval is truncated.)
+   *
+   * Nonetheless, this method is provided because it can be useful in situations where the caller asserts that none of
+   * these edge cases are possible. */
+  static Interval baseSizeTrunc(Value lo, size_t size) {
+    Interval retval;
+    if (0 == size)
+      return retval;
+    if (baseSizeOverflows(lo, size)) {
+      retval.lo_ = lo;
+      retval.hi_ = Value.max;
+    } else {
+      retval.lo_ = lo;
+      retval.hi_ = cast(Value)(lo + size - 1);
+    }
+    return retval;
+  }
+    
+  /** True if this interval is empty. */
   bool empty() const @property {
     return 1 == lo_ && 0 == hi_;
   }
 
-  // Length of interval if possible, exception otherwise.
+  /** Length of interval if possible, exception otherwise. */
   size_t length() const @property {
     if (empty)
       return 0;
@@ -121,47 +155,58 @@ public:
     return n + 1UL;
   }
 
-  // Return interval minimum if not empty.
+  /** Return interval minimum if not empty. */
   Value least() const @property {
     assert(!empty());
     return lo_;
   }
 
-  // Return interval maximum if not empty.
+  /** Return interval maximum if not empty. */
   Value greatest() const @property {
     assert(!empty());
     return hi_;
   }
 
-  // True if this and the other have no elements in common. An empty interval is disjoint with any other interval since
+  /** True if this and the other have no elements in common.
+   *
+   *  An empty interval is disjoint with any other interval since */
   // they have no elements in common.
   bool disjoint(Interval other) const {
     return empty || other.empty || this.hi_ < other.lo_ || this.lo_ > other.hi_;
   }
+
+  /** ditto */
   bool disjoint(Value other) const {
     return empty || hi_ < other || lo_ > other;
   }
 
-  // True if this and the other have at least one element in common.  An empty interval overlaps with no other interval
-  // since it has no elements in common with any other.
+  /** True if this and the other have at least one element in common.
+   *
+   *  An empty interval overlaps with no other interval since it has no elements in common with any other. */
   bool overlaps(Interval other) const {
     return !disjoint(other);
   }
+
+  /** ditto */
   bool overlaps(Value other) const {
     return !empty && lo_ <= other && hi_ >= other;
   }
 
-  // True if this interval contains all of other (i.e., subset relationship). An empty interval is contained in all
-  // other intervals since the empty interval is a subset of all intervals.
+  /** True if this interval contains all of other (i.e., subset relationship).
+   *
+   *  An empty interval is contained in all other intervals since the empty interval is a subset of all intervals. */
   bool contains(Interval other) const {
     return other.empty || (!empty && least <= other.least && greatest >= other.greatest);
   }
+
+  /** ditto */
   bool contains(Value other) const {
     return !empty && least <= other && greatest >= other;
   }
 
-  // The elements in common between this and the other interval.  The intersection of an empty interval and any other
-  // interval is an empty interval.
+  /** The elements in common between this and the other interval.
+   *
+   *  The intersection of an empty interval and any other interval is an empty interval. */
   Interval intersect(Interval other) const {
     Interval retval;
     if (disjoint(other))
@@ -170,52 +215,70 @@ public:
     retval.hi_ = min(this.hi_, other.hi_);
     return retval;
   }
+
+  /** ditto */
   Interval intersect(Value other) const {
     return overlaps(other) ? Interval(other) : Interval();
   }
 
-  // Returns an interval that starts at the same value but has at most N elements.
+  /** Returns an interval that starts at the same value but has at most N elements. */
   Interval limit(size_t n) const {
     return empty ? this : hull(least, min(greatest, cast(Value)(least + n - 1)));
   }
     
-  // True if this interval's least value is less than the other interval's least value. An empty interval is considered
-  // to start before a non-empty interval so that this method defines a strict weak ordering.
+  /** True if this interval's least value is less than the other interval's least value.
+   *
+   *  An empty interval is considered to start before a non-empty interval so that this method defines a strict weak ordering. */
   bool startsBefore(Interval other) const {
     return empty || other.empty ? empty && !other.empty : least < other.least;
   }
+
+  /** ditto */
   bool startsBefore(Value other) const {
     return empty ? true : least < other;
   }
 
-  // True if this interval's greatest value is greater than the other interval's greatest value. An empty interval is
-  // considered to end before a non-empty interval so that this method defines a strict weak ordering.
+  /** True if this interval's greatest value is greater than the other interval's greatest value.
+   *
+   *  An empty interval is considered to end before a non-empty interval so that this method defines a strict weak ordering. */
   bool endsAfter(Interval other) const {
     return empty || other.empty ? !empty && other.empty : greatest > other.greatest;
   }
+
+  /** ditto */
   bool endsAfter(Value other) const {
     return empty ? false : greatest > other;
   }
 
-  // True if this interval ends one before the other interval begins. False if either interval is empty.
+  /** True if this interval ends one before the other interval begins.
+   *
+   *  False if either interval is empty. */
   bool leftAdjacent(Interval other) const {
     return empty || other.empty ? false : greatest < Value.max && cast(Value)(greatest + 1) == other.least;
   }
+
+  /** ditto */
   bool leftAdjacent(Value other) const {
     return leftAdjacent(Interval(other));
   }
 
-  // True if this interval begins one after the other interval ends. False if either interval is empty.
+  /** True if this interval begins one after the other interval ends.
+   *
+   *  False if either interval is empty. */
   bool rightAdjacent(Interval other) const {
     return other.leftAdjacent(this);
   }
+
+  /** ditto */
   bool rightAdjacent(Value other) const {
     return Interval(other).leftAdjacent(this);
   }
 
-  // Split this interval into two adjacent intervals: the left and right parts. If "at" is not a member of this
-  // interval, then one of the returned intervals will equal this interval and the other will be empty: if "at" is left
-  // of this interval then the left interval will be empty, otherwise the right interval will be empty.
+  /** Split this interval into two adjacent intervals: the left and right parts.
+   *
+   *  If "at" is not a member of this interval, then one of the returned intervals will equal this interval and the other
+   *  will be empty: if "at" is left of this interval then the left interval will be empty, otherwise the right interval
+   *  will be empty. */
   Tuple!(Interval, Interval) split(Value at) const {
     Interval left, right;
     if (empty) {
@@ -232,41 +295,102 @@ public:
     return tuple!(Interval, Interval)(left, right);
   }
 
-  // The values of this interval that are less than or equal to v.
+  /** The values of this interval that are less than or equal to v. */
   pure Interval lessThanEqual(Value v) const @safe {
     return empty ? Interval() : intersect(Interval.hull(Value.min, v));
   }
 
-  // The values of this interval that are less than v.
+  /** The values of this interval that are less than v. */
   pure Interval lessThan(Value v) const @safe {
     return empty || v == Value.min ? Interval() : intersect(Interval.hull(Value.min, cast(Value)(v-1)));
   }
 
-  // The values of this interval that are greater than or equal to v.
+  /** The values of this interval that are greater than or equal to v. */
   pure Interval greaterThanEqual(Value v) const @safe {
     return empty ? Interval() : intersect(Interval.hull(v, Value.max));
   }
 
-  // The values of this interval that are greater than v.
+  /** The values of this interval that are greater than v. */
   pure Interval greaterThan(Value v) const @safe {
     return empty || v == Value.max ? Interval() : intersect(Interval.hull(cast(Value)(v+1), Value.max));
   }
 
-  // The value of this interval that is equal to v.
+  /** The value of this interval that is equal to v. */
   pure Interval equalTo(Value v) const @safe {
     return empty || v < least || v > greatest ? Interval() : Interval(v);
   }
 
-  // Make an interval bigger by extending it by one in each direction as possible.
+  /** Make an interval bigger by extending it by one in each direction as possible. */
   pure Interval grow() const @safe {
     assert(!empty);
     Value lo = least > Value.min ? cast(Value)(least - 1) : least;
     Value hi = greatest < Value.max ? cast(Value)(greatest + 1) : greatest;
     return hull(lo, hi);
   }
+
+  /** Create a new interval by adding a constant to all values of this interval. */
+  pure Interval shiftRight(Value shiftAmount) const @safe {
+    Interval retval;
+    if (!empty) {
+      if (shiftAmount > Value.max - this.hi_)
+        throw new RangeError;
+      retval.lo_ = cast(Value)(this.lo_ + shiftAmount);
+      retval.hi_ = cast(Value)(this.hi_ + shiftAmount);
+    }
+    return retval;
+  }
+
+  /** Create a new interval by subtracting a constant from all values of this interval. */
+  pure Interval shiftLeft(Value shiftAmount) const @safe {
+    Interval retval;
+    if (!empty) {
+      if (shiftAmount > this.lo_ - Value.min)
+        throw new RangeError;
+      retval.lo_ = cast(Value)(this.lo_ - shiftAmount);
+      retval.hi_ = cast(Value)(this.hi_ - shiftAmount);
+    }
+    return retval;
+  }
+
+  /** Add to all values, but clip overflows.
+   *
+   *  Creates a new interval adding a constant to all values of this interval, but clip overflows rather than throwing an
+   *  exception.  For instance, if this interval is unsigned bytes [100,199] and you right shift by 100, the result will
+   *  be [200,255] since 255 is the largest possible unsigned byte. */
+  pure Interval shiftRightClip(Value shiftAmount) const @safe {
+    Interval retval;
+    if (!empty && shiftAmount <= Value.max - this.lo_) {
+        retval.lo_ = cast(Value)(this.lo_ + shiftAmount);
+        retval.hi_ = shiftAmount <= Value.max - this.hi_ ? cast(Value)(this.hi_ + shiftAmount) : Value.max;
+    }
+    return retval;
+  }
+
+  /** Subtract from all values, but clip overflows.
+   *
+   *  Creates a new interval by subtracting a constant from all values of this interval, but clip overflows rather than
+   *  throwing an exception.  For instance, if the interval is unsigned [10, 20] and the shift amount is 15, then the
+   *  result will be [0, 5] since zero is the minimum unsigned value. */
+  pure Interval shiftLeftClip(Value shiftAmount) const @safe {
+    Interval retval;
+    if (!empty && shiftAmount <= this.hi_ - Value.min) {
+      retval.lo_ = shiftAmount <= this.lo_ - Value.min ? cast(Value)(this.lo_ - shiftAmount) : Value.min;
+      retval.hi_ = cast(Value)(this.hi_ - shiftAmount);
+    }
+    return retval;
+  }
+
+  /** Add or subtract, but clip overflows.
+   *
+   *  Create a new interval shifted left or right depending on whether the shift amount is negative or positive, respectively.
+   *  Since signed values can only represent half the size, you can only shift the interval half the total amount. */
+  pure Interval shift(Signed!Value shiftAmount) const @safe {
+    return shiftAmount < 0 ? shiftLeft(shiftAmount) : shiftRight(shiftAmount);
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/** Compile-time check that type I is an interval. */
 template isInterval(I) {
   static if (is(I T: Interval!T))
     enum isInterval = true;
@@ -274,7 +398,15 @@ template isInterval(I) {
     enum isInterval = false;
 }
 
-// Given a list of non-overlapping intervals in increasing order, return the complement list of intervals.
+/** Given a list of intervals, trim them to be within the specified interval. */
+pure auto intersect(Range, Interval)(Range range, Interval within) @safe
+if (isInputRange!Range && isInterval!(ElementType!Range) && is(ElementType!Range == Interval)) {
+  return range
+    .map!(interval => interval.intersect(within))
+    .filter!(interval => !interval.empty);
+}
+
+/** Given a list of non-overlapping intervals in increasing order, return the complement list of intervals. */
 pure auto inverseIntervals(Range)(Range range) @safe
 if (isInputRange!Range && isInterval!(ElementType!Range)) {
 
@@ -302,14 +434,14 @@ if (isInputRange!Range && isInterval!(ElementType!Range)) {
       assert(!empty);
       current = Interval.whole.greaterThan(current.greatest);
       if (!current.empty)
-	fillCurrent();
+        fillCurrent();
     }
 
     static if (isForwardRange!Range) {
       pure InverseIntervals save() @safe {
-	auto copy = InverseIntervals(range.save);
-	copy.current = current;
-	return copy;
+        auto copy = InverseIntervals(range.save);
+        copy.current = current;
+        return copy;
       }
     }
 
@@ -320,13 +452,13 @@ if (isInputRange!Range && isInterval!(ElementType!Range)) {
 
       // Advance current to the right until we reach a hole or the end
       while (!range.empty && range.front.least == current.least) {
-	current = current.greaterThan(range.front.greatest);
-	range.popFront();
+        current = current.greaterThan(range.front.greatest);
+        range.popFront();
       }
 
       // Trim the right side of current so it's *just* the hole.
       if (!range.empty)
-	current = current.lessThan(range.front.least);
+        current = current.lessThan(range.front.least);
     }
   }
 
@@ -334,6 +466,12 @@ if (isInputRange!Range && isInterval!(ElementType!Range)) {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+unittest {} // to prevent the following tests from being documented
+
+unittest {
+  import std.stdio;
+  writeln("unit tests: ", __FILE__);
+}
 
 //-------- isInterval --------
 @safe pure unittest {
@@ -436,6 +574,14 @@ pure unittest {
   auto bs3 = Interval!byte.baseSize(-128, 256);
   assert(bs3.least == -128);
   assert(bs3.greatest == 127);
+
+  auto bs4 = Interval!byte.baseSizeTrunc(120, 10);
+  assert(bs4.least == 120);
+  assert(bs4.greatest == 127);
+
+  auto bs5 = Interval!ubyte.baseSizeTrunc(250, 257);
+  assert(bs5.least == 250);
+  assert(bs5.greatest == 255);
 }
 
 pure unittest {

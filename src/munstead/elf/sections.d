@@ -8,12 +8,97 @@ import munstead.core.byteorder;
 import munstead.core.exception;
 import munstead.core.interval;
 import munstead.core.mmap;
+import munstead.core.util;
 import munstead.core.wordtypes;
 import munstead.elf.files;
 import munstead.elf.segments;
 import munstead.elf.types;
-import std.algorithm: joiner, map, max, until;
+import std.algorithm: filter, joiner, map, max, until;
+import std.array: array;
 import std.conv: to;
+import std.range: enumerate, take;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// A region of a file or virtual memory
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+class ElfSection(size_t nBits): AsmSection!nBits {
+  mixin AstNodeFeatures;
+  struct AstChildren {}
+
+  // Initialize file and memory offsets and sizes and other such things from the ELF section table entry
+  void createContent(ElfSectionTableEntry!nBits shent) {
+    assert(shent !is null);
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
+    assert(fhdr !is null);
+
+    fileExtent = shent.fileExtent;
+    createSectionBytes!(MemoryMap!(Word!nBits))(fhdr.fileBytes, fileExtent, AddressSpace.FILE);
+
+    preferredExtent = Interval!(Word!nBits).baseSizeTrunc(shent.disk.sh_addr, shent.disk.sh_size);
+
+    name = shent.name;
+  }
+
+  void createContent(ElfSegmentTableEntry!nBits phent) {
+    assert(phent !is null);
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
+    assert(fhdr !is null);
+
+    fileExtent = phent.fileExtent;
+    createSectionBytes!(MemoryMap!(Word!nBits))(fhdr.fileBytes, fileExtent, AddressSpace.FILE);
+
+    preferredExtent = phent.preferredExtent;
+  }
+
+  void createContent(MemoryMap!(Word!nBits) mmap, Interval!(Word!nBits) interval) {
+    preferredExtent = interval;
+    createSectionBytes!(MemoryMap!(Word!nBits))(mmap, interval, AddressSpace.MEMORY);
+  }
+
+  // Section table entry associated with section, or null
+  ElfSectionTableEntry!nBits sectionTableEntry() {
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
+    assert(fhdr !is null);
+    if (fhdr.sectionTable !is null) {
+      foreach (shent; fhdr.sectionTable.entries[]) {
+        if (shent.section is this)
+          return shent;
+      }
+    }
+    return null;
+  }
+
+  // Set properties based on sh_link and sh_info fields.  This function should only be called after the entire
+  // ELF section table is parsed and all sections have been created. Subclasses will generally override this.
+  void setLinkInfo(ElfSectionTableEntry!nBits shent, ParseLocation parentLoc) {};
+
+  // Printable name of section
+  override string printableName() {
+    string[] parts;
+
+    if (auto fhdr = ancestor!(ElfFileHeader!nBits)) {
+      if (fhdr.sectionTable !is null)
+        parts ~= fhdr.sectionTable.indexesOf(this).take(1).map!(i => "section " ~ to!string(i)).array;
+
+      if (fhdr.segmentTable !is null)
+        parts ~= fhdr.segmentTable.indexesOf(this).take(1).map!(i => "segment " ~ to!string(i)).array;
+    }
+
+    if (name != "")
+      parts ~= name.cEscape;
+
+    if (comment != "")
+      parts ~= comment;
+
+    string ret;
+    for (size_t i=0; i<parts.length; ++i)
+      ret ~= (i > 0 ? ", " : "") ~ parts[i];
+    if (ret == "")
+      ret = "no name, no table";
+    return ret;
+  }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // A section table contains zero or more section table entries
@@ -26,20 +111,20 @@ class ElfSectionTable(size_t nBits): Ast {
   }
 
   enum SectionIndex { SHN_UNDEF=0, SHN_LORESERVE=0xff00, SHN_LOPROC=0xff00, SHN_HIPROC=0xff1f, SHN_LOOS=0xff20,
-		      SHN_HIOS=0xff3f, SHN_ABS=0xfff1, SHN_COMMON=0xfff2, SHN_XINDEX=0xffff, SHN_HIRESERVE=0xffff }
+                      SHN_HIOS=0xff3f, SHN_ABS=0xfff1, SHN_COMMON=0xfff2, SHN_XINDEX=0xffff, SHN_HIRESERVE=0xffff }
+
+  Word!nBits startOffset;
 
   this() {
     entries = new AstList!(ElfSectionTableEntry!nBits);
   }
 
-  static ElfSectionTable
-  parse(MemoryMap)(MemoryMap file, ElfFileHeader!nBits fhdr) {
+  void parse(ParseLocation parentLoc) {
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
     assert(fhdr !is null);
-    enum me = "ELF-" ~ to!string(nBits) ~ " section table";
-    auto ret = new ElfSectionTable;
-    MemoryMap.Address firstOffset = fhdr.disk.e_shoff;
-    size_t nEntries = fhdr.disk.e_shnum;
-    size_t bytesPerEntry = fhdr.disk.e_shentsize;
+
+    startOffset = fhdr.disk.e_shoff;
+    auto tableLoc = fhdr.fileLocation(fhdr.formatName ~ " section table", startOffset, parentLoc);
    
     // Table entry #0 is always SHT_NULL and usually zero filled. However, two fields are special:
     //   1. If sh_size is non-zero then it is the actual number of table entries. The file header's e_shnum field is
@@ -48,37 +133,56 @@ class ElfSectionTable(size_t nBits): Ast {
     //
     //   2. If sh_link is non-zero, then it's the index of the section table's string section and the file header should
     //      contain SHN_XINDEX.
-
+    size_t nEntries = fhdr.disk.e_shnum;
     foreach (entryNumber; 0 .. max(1, nEntries)) {
-      auto entryOffset = cast(MemoryMap.Address)(firstOffset + entryNumber * bytesPerEntry);
-      auto entry = ElfSectionTableEntry!nBits.parse!MemoryMap(file, entryOffset, bytesPerEntry, fhdr.byteOrder);
-      entry.index = entryNumber;
-      if (entry.errors.length > 0)
-        ret.appendError(new SyntaxError(me~" problem parsing entry #" ~ to!string(entryNumber), file.name, entryOffset));
-      ret.entries.pushBack(entry);
+      auto entryLoc = indexParseLocation(fhdr.formatName ~ " section table entry", entryNumber, tableLoc);
+      auto entry = ElfSectionTableEntry!nBits.instance();
+      entries.pushBack(entry);
+      entry.parse(entryLoc);
 
       if (0 == entryNumber && entry.disk.sh_size > 0) {
-	if (nEntries != 0)
-	  ret.appendError(new SyntaxError(me~" entry #0 sh_size and header e_shnum are both non-zero", file.name, entryOffset));
-	nEntries = entry.disk.sh_size; // standard says to use this if present
+        if (nEntries != 0)
+          appendError(entryLoc, "entry #0 sh_size (" ~ entry.disk.sh_size.to!string ~ ")" ~
+                      " and header e_shnum (" ~ fhdr.disk.e_shnum.to!string ~ ") are both non-zero");
+        nEntries = entry.disk.sh_size; // standard says to use this if present
       }
     }
-    return ret;
+  }
+
+  // Returns the indexes of all the section table entries that point to the specified section. The return value is an
+  // input range.
+  auto indexesOf(ElfSection!nBits section) {
+    return entries[]
+      .enumerate
+      .filter!(a => a.value.section is section)
+      .map!"a.index";
   }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 class ElfSectionTableEntry(size_t nBits): Ast {
   mixin AstNodeFeatures;
+  struct AstChildren {}
 
-  struct AstChildren {
-    ElfSection!nBits section; 	// section created for this table entry
-  }
+  // Optional section associated with this table entry. The section is not part of the AST here because we need to
+  // support all of the following:
+  //   1. A section created due to its description in this section table
+  //   2. A section created due to its description in the segment (program header) table
+  //   3. A section being described by both the section table and the segment table
+  //   4. A section not appearing in either table (such as some in the .dynamic section in virtual memory)
+  //
+  // Therefore, sections are linked into the the AST as children of the ElfFileHeader instead.
+  ElfSection!nBits section;
 
   enum SectionType : Elf!nBits.Word {
     SHT_NULL=0, SHT_PROGBITS=1, SHT_SYMTAB=2, SHT_STRTAB=3, SHT_RELA=4, SHT_HASH=5, SHT_DYNAMIC=6, SHT_NOTE=7,
     SHT_NOBITS=8, SHT_REL=9, SHT_SHLIB=10, SHT_DYNSYM=11, /*12  & 13 are missing*/ SHT_INIT_ARRAY=14,
     SHT_FINI_ARRAY=15, SHT_PREINIT_ARRAY=16, SHT_GROUP=17, SHT_SYMTAB_SHNDX=18,
+
+    SHT_GNU_HASH = 0x6ffffff6,
+    SHT_VERNEED =  0x6ffffffe,
+    SHT_VERSYM =   0x6fffffff,
+  
     SHT_LOOS=0x60000000, SHT_HIOS=0x6fffffff, SHT_LOPROC=0x70000000, SHT_HIPROC=0x7fffffff,
     SHT_LOUSER=0x80000000, SHT_HIUSER=0xffffffff }
 
@@ -103,29 +207,31 @@ class ElfSectionTableEntry(size_t nBits): Ast {
 
   Disk disk;
   string name;
-  size_t index; // index in the section table
+  size_t index;                 // index in section table
+  Word!nBits startOffset;
 
-  // Parse an entry from some part of a file
-  static ElfSectionTableEntry
-  parse(MemoryMap)(MemoryMap file, MemoryMap.Address offset, size_t bytesPerEntry, ByteOrder byteOrder) {
-    enum me = "ELF-" ~ to!string(nBits) ~ " section table entry";
-    auto ret = new ElfSectionTableEntry;
+  void parse(ParseLocation parentLoc) {
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
+    assert(fhdr !is null);
+    auto table = ancestor!(ElfSectionTable!nBits);
+    assert(table !is null);
 
-    if (bytesPerEntry < ret.disk.sizeof)
-      ret.appendError(new SyntaxError(me ~ " actual size (" ~ to!string(ret.disk.sizeof) ~ ")" ~
-                                      " is larger than header-specified size (" ~ to!string(bytesPerEntry) ~ ")",
-                                      file.name, offset));
+    index = table.entries.length - 1;
+    assert(table.entries[index] is this);
+    startOffset = cast(Word!nBits)(table.startOffset + index * Disk.sizeof);
+    auto loc = fhdr.fileLocation(fhdr.formatName ~ " section table entry", startOffset, parentLoc);
+    
+    if (fhdr.disk.e_shentsize < Disk.sizeof)
+      appendError(loc, "section table entry size (" ~ Disk.sizeof.to!string ~ ")" ~
+                  " is larger than header e_shentsize (" ~ fhdr.disk.e_shentsize.to!string ~ ")");
 
-    if (!file.readObjectAt(offset, ret.disk))
-      ret.appendError(new SyntaxError(me ~ " short read", file.name, offset));
-    ret.disk = ret.disk.toNative(byteOrder);
+    if (!fhdr.fileBytes.readObjectAt(startOffset, disk))
+      appendError(loc, "short read");
+    disk = disk.toNative(fhdr.byteOrder);
 
-    Elf!nBits.Xword alignment = max(1, ret.disk.sh_addralign);
+    Elf!nBits.Xword alignment = max(1, disk.sh_addralign);
     if (popcnt(alignment) > 1)
-      ret.appendError(new SyntaxError(me ~ " sh_addralign (" ~ to!string(ret.disk.sh_addralign) ~ ") should be a power of two",
-                                      file.name, offset));
-
-    return ret;
+      appendError(loc, "sh_addralign (" ~ disk.sh_addralign.to!string ~ ") should be a power of two");
   }
 
   // Location of section within file
@@ -133,83 +239,24 @@ class ElfSectionTableEntry(size_t nBits): Ast {
     if (disk.sh_type == SectionType.SHT_NOBITS) {
       return Interval!(Elf!nBits.Off)();
     } else {
-      return Interval!(Elf!nBits.Off).baseSize(disk.sh_offset, disk.sh_size);
+      return Interval!(Elf!nBits.Off).baseSizeTrunc(disk.sh_offset, disk.sh_size);
     }
   }
 
   // Preferred location of section within memory
   Interval!(Elf!nBits.Addr) preferredExtent() @property {
     if (disk.sh_flags.isSet(SectionFlags.SHF_ALLOC)) {
-      return Interval!(Elf!nBits.Addr).baseSize(disk.sh_addr, disk.sh_size);
+      return Interval!(Elf!nBits.Addr).baseSizeTrunc(disk.sh_addr, disk.sh_size);
     } else {
       return Interval!(Elf!nBits.Addr)();
     }
   }
-}
 
-////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// Any section from a file.
-class ElfSection(size_t nBits): AsmSection!nBits {
-  mixin AstNodeFeatures;
-  struct AstChildren {}
-
-  // Initialize file and memory offsets and sizes and other such things from the ELF section table entry
-  void initFromSectionTableEntry(MemoryMap)(MemoryMap file, ElfSectionTableEntry!nBits shent) {
-    assert(shent !is null);
-
-    fileExtent = shent.fileExtent;
-    createSectionMmap!MemoryMap(file, fileExtent);
-    preferredExtent = Interval!(Word!nBits).baseSize(shent.disk.sh_addr, shent.disk.sh_size);
-    name = shent.name;
-  }
-
-  void initFromSegmentTableEntry(MemoryMap)(MemoryMap file, ElfSegmentTableEntry!nBits phent) {
-    assert(phent !is null);
-
-    fileExtent = phent.fileExtent;
-    createSectionMmap!MemoryMap(file, fileExtent);
-    preferredExtent = phent.preferredExtent;
-    name = "segment #" ~ to!string(phent.index);
-  }
-
-  // Index of section within the ELF section table.
-  size_t sectionTableIndex() {
-    auto shent = this.ancestor!(ElfSectionTableEntry!nBits);
-    assert(shent !is null);
-    return shent.index;
-  }
-
-  // Return the string starting at the specified section-relative address. ELF string tables store 8-bit NUL-terminated
-  // strings.
-  string stringAt(Word!nBits sra, size_t maxBytes = 1024*1024*1024) {
-    string me = "ELF-" ~ to!string(nBits) ~ (name=="" ? "" : " " ~ name) ~ " section";
-    string s;
-
-    if (!mmap) {
-      appendError(new SyntaxError(me ~ " has no memory map", mmap.name, sra));
-
-    } else {
-      import std.range;
-      enum chunkSize = 128 /*arbitrary*/;
-      size_t maxChunks = (maxBytes + chunkSize - 1) / chunkSize;
-
-      auto chars = mmap.segmentsAt(sra).contiguous
-	.byBuffer(chunkSize).map!"a.buffer"
-	.take(maxChunks)
-	.joiner.until!"a == 0"(No.openRight)
-	.array;
-
-      if (0 == chars.length)
-	appendError(new SyntaxError(me ~ " string starting address " ~ to!string(sra) ~ " is out of range",
-				    mmap.name, sra));
-
-      if (chars[$-1] != 0)
-	appendError(new SyntaxError(me ~ " string starting at sra " ~ to!string(sra) ~
-				    " is not NUL-terminated", "", 0)); // FIXME: location?
-
-      s = (cast(char[]) chars[0..$-1]).idup;
-    }
-    return s;
+  // Printable name of a section table entry, properly escaped
+  string printableName() {
+    if (section)
+      return section.printableName;
+    return "section " ~ to!string(index) ~ ", " ~ name.cEscape;
   }
 }
+

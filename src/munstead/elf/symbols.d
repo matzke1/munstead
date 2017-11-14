@@ -4,6 +4,8 @@ import munstead.ast.base;
 import munstead.core.byteorder;
 import munstead.core.exception;
 import munstead.core.mmap;
+import munstead.core.util;
+import munstead.core.wordtypes;
 import munstead.elf.files;
 import munstead.elf.sections;
 import munstead.elf.strings;
@@ -23,21 +25,16 @@ class ElfSymbolSectionIndexTable(size_t nBits): ElfSection!nBits {
 
   Elf!32.Word[] sectionIndexes; // array is parallel with ElfSymbolTable!nBits.symbols
 
-  static ElfSymbolSectionIndexTable
-  parse(MemoryMap)(MemoryMap file, ElfFileHeader!nBits fhdr, ElfSectionTableEntry!nBits shent) {
+  void parse(ParseLocation parentLoc) {
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
     assert(fhdr !is null);
-    assert(shent !is null);
-    enum me = "ELF-" ~ to!string(nBits) ~ " symbol section-index table";
-    auto ret = new ElfSymbolSectionIndexTable;
-    ret.initFromSectionTableEntry(file, shent);
-    
-    ret.sectionIndexes = ret.mmap
+    assert(bytes !is null);
+
+    sectionIndexes = bytes
       .segmentsAt(0).contiguous
       .byBuffer(Elf!32.Word.sizeof)
       .map!(node => toNative((cast(Elf!32.Word[])(node.buffer))[0], fhdr.byteOrder))
       .array;
-
-    return ret;
   }
 }
 
@@ -57,23 +54,21 @@ class ElfSymbolTable(size_t nBits): ElfSection!nBits {
     symbols = new AstList!(ElfSymbol!nBits);
   }
 
-  // Create a new symbol table by parsing the symbols starting at the specified file offset.
-  static ElfSymbolTable
-  parse(MemoryMap)(MemoryMap file, ElfFileHeader!nBits fhdr, ElfSectionTableEntry!nBits shent) {
-    enum me = "ELF-" ~ to!string(nBits) ~ " symbol table";
-    auto ret = new ElfSymbolTable;
-    ret.initFromSectionTableEntry(file, shent);
+  void parse(ParseLocation parentLoc) {
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
+    assert(fhdr !is null);
+    auto tableLoc = sectionLocation(fhdr.formatName ~ " symbol table", 0, parentLoc);
 
     // sh_link is the index of the section containing the string table for these symbols.
+    auto shent = sectionTableEntry();
+    assert(shent !is null);
     if (0 != shent.disk.sh_link) {
       if (shent.disk.sh_link >= fhdr.sectionTable.entries.length) {
-	ret.appendError(new SyntaxError(me ~ " sh_link (" ~ to!string(shent.disk.sh_link) ~ ") is out or range",
-					file.name, 0)); // FIXME: location
+        appendError(tableLoc, "sh_link (" ~ shent.disk.sh_link.to!string ~ ") is out or range");
       } else {
-	ret.stringTable = cast(ElfStringTable!nBits) fhdr.sectionTable.entries[shent.disk.sh_link].section;
-	if (ret.stringTable is null)
-	  ret.appendError(new SyntaxError(me ~ " sh_link (" ~ to!string(shent.disk.sh_link) ~ ") is not a string table",
-					  file.name, 0)); // FIXME: location
+        stringTable = cast(ElfStringTable!nBits) fhdr.sectionTable.entries[shent.disk.sh_link].section;
+        if (stringTable is null)
+          appendError(tableLoc, "sh_link (" ~ shent.disk.sh_link.to!string ~ ") is not a string table");
       }
     }
 
@@ -83,32 +78,27 @@ class ElfSymbolTable(size_t nBits): ElfSection!nBits {
     foreach (testEnt; fhdr.sectionTable.entries[]) {
       auto shndx = cast(ElfSymbolSectionIndexTable!nBits) testEnt.section;
       if (shndx !is null && testEnt.disk.sh_link == shent.index) {
-	if (ret.sectionIndexTable !is null) {
-	  ret.appendError(new SyntaxError(me ~ " has multiple section index tables", file.name, 0));
-	} else {
-	  ret.sectionIndexTable = shndx;
-	}
+        if (sectionIndexTable !is null) {
+          appendError(tableLoc, "has multiple section index tables");
+        } else {
+          sectionIndexTable = shndx;
+        }
       }
     }
 
     // Calculate number of symbols
     size_t bytesPerSymbol = ElfSymbol!nBits.Disk.sizeof;
-    size_t nSymbols = ret.fileExtent.length / bytesPerSymbol;
+    size_t nSymbols = fileExtent.length / bytesPerSymbol;
     if (0 == nSymbols)
-      ret.appendError(new SyntaxError(me ~ " must contain at least one symbol of for STN_UNDEF",
-				      shent.name, 0));
+      appendError(tableLoc, "empty symbol table is missing STN_UNDEF entry");
 
     // Parse each symbol
     foreach (symbolNumber; 0 .. nSymbols) {
-      auto symbolOffset = cast(MemoryMap.Address)(symbolNumber * bytesPerSymbol);
-      auto symbol = ElfSymbol!nBits.parse!MemoryMap(ret, symbolNumber, symbolOffset, fhdr.byteOrder);
-      if (symbol.errors.length > 0)
-        ret.appendError(new SyntaxError(me~" problem parsing symbol #" ~ to!string(symbolNumber),
-					shent.name, symbolOffset));
-      ret.symbols.pushBack(symbol);
+      auto entryLoc = indexParseLocation(fhdr.formatName ~ " symbol", symbolNumber, tableLoc);
+      auto entry = ElfSymbol!nBits.instance();
+      symbols.pushBack(entry);
+      entry.parse(entryLoc);
     }
-
-    return ret;
   }
 
 }
@@ -122,7 +112,7 @@ class ElfSymbol(size_t nBits): Ast {
   enum Binding { STB_LOCAL=0, STB_GLOBAL=1, STB_WEAK=2, STB_LOOS=10, STB_HIOS=12, STB_LOPROC=13, STB_HIPROC=15 }
 
   enum Type { STT_NOTYPE=0, STT_OBJECT=1, STT_FUNC=2, STT_SECTION=3, STT_FILE=4, STT_COMMON=5,
-	      STT_TLS=6, STT_LOOS=10, STT_HIOS=12, STT_LOPROC=13, STT_HIPROC=15 }
+              STT_TLS=6, STT_LOOS=10, STT_HIOS=12, STT_LOPROC=13, STT_HIPROC=15 }
 
   enum Visibility { STV_DEFAULT=0, STV_INTERNAL=1, STV_HIDDEN=2, STV_PROTECTED=3 }
 
@@ -148,65 +138,94 @@ class ElfSymbol(size_t nBits): Ast {
   }
 
   Disk disk;
+  size_t index;                 // index of this symbol in the parent table
   string name;
   Binding binding;
   Type type;
   Visibility visibility;
-  size_t linkedSectionIndex;
+  size_t linkedSectionIndex; // zero means no linked section
 
-  static ElfSymbol
-  parse(MemoryMap)(ElfSymbolTable!nBits symtab, size_t symbolIndex, MemoryMap.Address offset, ByteOrder byteOrder) {
+  void parse(ParseLocation parentLoc) {
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
+    assert(fhdr !is null);
+    auto symtab = ancestor!(ElfSymbolTable!nBits);
     assert(symtab !is null);
-    enum me = "ELF-" ~ to!string(nBits) ~ " symbol";
-    auto ret = new ElfSymbol;
 
-    if (!symtab.mmap.readObjectAt(offset, ret.disk))
-      ret.appendError(new SyntaxError(me ~ " short read", symtab.mmap.name, offset));
-    ret.disk = ret.disk.toNative(byteOrder);
+    index = symtab.symbols.length - 1;
+    assert(symtab.symbols[index] is this);
+    auto offset = cast(Word!nBits) (index * Disk.sizeof);
+    auto loc = symtab.sectionLocation(fhdr.formatName ~ " symbol table entry", offset, parentLoc);
+
+    if (!symtab.bytes.readObjectAt(offset, disk))
+      appendError(loc, "short read");
+    disk = disk.toNative(fhdr.byteOrder);
 
     // Name
-    if (ret.disk.st_name > 0) {
+    if (disk.st_name > 0) {
       if (symtab.stringTable is null) {
-	ret.appendError(new SyntaxError(me ~ " st_name (" ~ to!string(ret.disk.st_name) ~ ") " ~
-					"non-zero but no string table",
-					symtab.mmap.name, offset));
+        appendError(loc, "st_name (" ~ disk.st_name.to!string ~ ") is non-zero but no string table");
       } else {
-	ret.name = symtab.stringTable.stringAt(ret.disk.st_name);
+        name = symtab.stringTable.stringAt(disk.st_name, this, loc);
       }
     }
 
     // Linked section index. We can't store ptrs to linked sections yet because we might not have parsed all the linked
     // sections, but we can at least store the linked section's index in the section table.
-    if (ret.disk.st_shndx == ElfSectionTable!nBits.SectionIndex.SHN_XINDEX) {
-      if (symtab.sectionIndexTable is null) {
-	ret.appendError(new SyntaxError(me ~ " st_shndx is SHN_XINDEX but no section index table",
-					symtab.mmap.name, offset));
-      } else if (symbolIndex >= symtab.sectionIndexTable.sectionIndexes.length) {
-	ret.appendError(new SyntaxError(me ~ " st_shndx is SHN_XINDEX but section index table is too short",
-					symtab.mmap.name, offset));
-      } else {
-	ret.linkedSectionIndex = symtab.sectionIndexTable.sectionIndexes[symbolIndex];
-      }
-    } else if (symtab.sectionIndexTable !is null &&
-	       symbolIndex < symtab.sectionIndexTable.sectionIndexes.length &&
-	       symtab.sectionIndexTable.sectionIndexes[symbolIndex] != 0) {
-      ret.appendError(new SyntaxError(me ~ " st_shndx is not SHN_XINDEX but section index table has a non-zero value",
-				      symtab.mmap.name, offset));
-      ret.linkedSectionIndex = ret.disk.st_shndx;
-    } else {
-      ret.linkedSectionIndex = ret.disk.st_shndx;
-    }      
-     
-    // Bind, type, and visibility
-    ret.binding = cast(Binding)(ret.disk.st_info >> 4);
-    ret.type = cast(Type)(ret.disk.st_info & 0x0f);
-    ret.visibility = cast(Visibility)(ret.disk.st_other & 0x03);
+    with (ElfSectionTable!nBits.SectionIndex) {
+      switch (disk.st_shndx) {
+      case SHN_UNDEF:
+      case SHN_ABS:
+      case SHN_COMMON:
+        // These entries are special. They don't refer to linked sections.
+        break;
 
-    if ((ret.disk.st_other & ~ 0x03) != 0)
-      ret.appendError(new SyntaxError(me ~ " st_other (0x" ~ to!string(ret.disk.st_other, 16) ~ ") " ~
-				      "high order bits should be zero",
-				      symtab.mmap.name, offset));
-								     
-    return ret;
+      case SHN_XINDEX:
+        // The linked section is not stored in st_shndx, but rather in a parallel array called the section index table.
+        if (symtab.sectionIndexTable is null) {
+          appendError(loc, "st_shndx is SHN_XINDEX but no section index table");
+        } else if (index >= symtab.sectionIndexTable.sectionIndexes.length) {
+          appendError(loc, "st_shndx is SHN_XINDEX but section index table is too short");
+        } else {
+          linkedSectionIndex = symtab.sectionIndexTable.sectionIndexes[index];
+        }
+        break;
+
+      default:
+        // Plain old section index.
+        if (symtab.sectionIndexTable !is null &&
+            index < symtab.sectionIndexTable.sectionIndexes.length &&
+            symtab.sectionIndexTable.sectionIndexes[index] != 0) {
+          appendError(loc, "st_shndx is not SHN_XINDEX but section index table has a non-zero value");
+          linkedSectionIndex = disk.st_shndx;
+        } else {
+          linkedSectionIndex = disk.st_shndx;
+        }
+        break;
+      }
+    }
+
+    // Bind, type, and visibility
+    binding = cast(Binding)(disk.st_info >> 4);
+    type = cast(Type)(disk.st_info & 0x0f);
+    visibility = cast(Visibility)(disk.st_other & 0x03);
+
+    if ((disk.st_other & ~ 0x03) != 0)
+      appendError(loc, "st_other (" ~ disk.st_other.hexStr ~ ") high order bits should be zero");
+  }
+
+  // Returns a pointer to the linked section if there is one, otherwise null. This function is only available after all
+  // sections have been parsed.
+  ElfSection!nBits linkedSection() {
+    if (linkedSectionIndex == 0)
+      return null; // no link
+
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
+    assert(fhdr !is null);
+    assert(fhdr.sectionTable !is null);
+
+    if (linkedSectionIndex >= fhdr.sectionTable.entries.length)
+      return null; // out of range
+
+    return fhdr.sectionTable.entries[linkedSectionIndex].section;
   }
 }

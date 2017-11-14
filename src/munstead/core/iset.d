@@ -1,3 +1,4 @@
+/** Set repreented by intervals. */
 module munstead.core.iset;
 
 import core.exception;
@@ -8,6 +9,11 @@ import std.container.rbtree;
 import std.algorithm.searching;
 import std.range;
 
+/** A set of integral values represented intervals.
+ *
+ *  This container stores a set of values of type T and represents the members of the set as the union of as few
+ *  intervals as possible. Adding new members to the set may cause existing intervals to coalesce, and removing
+ *  values from the say may cause intervals to split. */
 class IntervalSet(T)
   : IntervalTree!(Interval!T, "a") {
 
@@ -15,8 +21,8 @@ public:
   alias Value = T;
 
 public:
-    
-  // Insert into this set those values contained in the specified interval.
+
+  /** Insert into this set those values contained in the specified interval. */
   pure void insert(Interval interval) @safe {
     if (interval.empty)
       return;
@@ -33,12 +39,12 @@ public:
     insertTreeNodes(toInsert);
   }
 
-  // Insert into this set a single value.
+  /** Insert into this set a single value. */
   pure void insert(Interval.Value v) @safe {
     insert(Interval(v));
   }
 
-  // Remove from this set those values contained in the specified interval.
+  /** Remove from this set those values contained in the specified interval. */
   pure void remove(Interval interval) @safe {
     auto overlaps = overlapRange(interval);
 
@@ -52,12 +58,12 @@ public:
     insertTreeNodes([left, right].filter!"!a.empty");
   }
 
-  // Remove from this set a single value
+  /** Remove from this set a single value. */
   pure void remove(Interval.Value v) @safe {
     remove(Interval(v));
   }
 
-  // Return the complement of this set.
+  /** Return the complement of this set. */
   pure IntervalSet complement() const @safe {
     IntervalSet retval = new IntervalSet;
     retval.insertTreeNodes(nodes().inverseIntervals);
@@ -65,6 +71,14 @@ public:
   }
 
   alias exists = existsAll;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+unittest {} // to prevent the following tests from being documented
+
+unittest {
+  import std.stdio;
+  writeln("unit tests: ", __FILE__);
 }
 
 //-------- constructors --------
@@ -85,7 +99,7 @@ pure @safe unittest {
   assert(set.empty);
 
   // insert a singleton
-  set.insert(-5);		// {-5}
+  set.insert(-5);               // {-5}
   assert(!set.empty);
   assert(set.length == 1);
   assert(set.nIntervals == 1);
@@ -106,7 +120,7 @@ pure @safe unittest {
   assert(set.hull == set.Interval.hull(-5, 4));
 
   // insert a range that joins to the left
-  set.insert(-4);		//  {-5, -4, 0, 1, 2, 3, 4}
+  set.insert(-4);               //  {-5, -4, 0, 1, 2, 3, 4}
   assert(set.length == 7);
   assert(set.nIntervals == 2);
   assert(set.hull == set.Interval.hull(-5, 4));
@@ -127,7 +141,7 @@ pure @safe unittest {
   assert(set.nIntervals == 1);
   assert(set.hull == set.Interval.hull(-5, 4));
 
-  set.clear();			// {}
+  set.clear();                  // {}
   assert(set.empty);
   assert(set.length == 0);
   assert(set.nIntervals == 0);
@@ -143,7 +157,7 @@ pure @safe unittest {
   assert(set.hull == set.Interval.hull(-5, 4));
 
   // remove nothing
-  set.remove(set.Interval());	// {-5, -4, -3, -2, -1, 0, 1, 2, 3, 4}
+  set.remove(set.Interval());   // {-5, -4, -3, -2, -1, 0, 1, 2, 3, 4}
   assert(set.length == 10);
   assert(set.nIntervals == 1);
   assert(set.hull == set.Interval.hull(-5, 4));
@@ -155,7 +169,7 @@ pure @safe unittest {
   assert(set.hull == set.Interval.hull(-5, 4));
 
   // remove from the left
-  set.remove(-5);		// {-4, 0, 1, 2, 3, 4}
+  set.remove(-5);               // {-4, 0, 1, 2, 3, 4}
   assert(set.length == 6);
   assert(set.nIntervals == 2);
   assert(set.hull == set.Interval.hull(-4, 4));
@@ -167,7 +181,7 @@ pure @safe unittest {
   assert(set.hull == set.Interval.hull(-4, 3));
 
   // remove from the from middle again
-  set.remove(2); 		// {-4, 0, 1, 3}
+  set.remove(2);                // {-4, 0, 1, 3}
   assert(set.length == 4);
   assert(set.nIntervals == 3);
   assert(set.hull == set.Interval.hull(-4, 3));
@@ -198,17 +212,17 @@ pure @safe unittest {
   assert(set.nIntervals == 1);
   assert(set.hull == set.Interval.whole());
 
-  set.remove(-127);		// {-128, [-126,127]}
+  set.remove(-127);             // {-128, [-126,127]}
   assert(set.length == 255);
   assert(set.nIntervals == 2);
   assert(set.hull == set.Interval.whole());
 
-  set.remove(-128); 		// {[-126,127]}
+  set.remove(-128);             // {[-126,127]}
   assert(set.length == 254);
   assert(set.nIntervals == 1);
   assert(set.hull == set.Interval.hull(-126, 127));
 
-  set.remove(127); 		// {[-126,126]}
+  set.remove(127);              // {[-126,126]}
   assert(set.length == 253);
   assert(set.nIntervals == 1);
   assert(set.hull == set.Interval.hull(-126, 126));

@@ -1,8 +1,12 @@
 module munstead.elf.interp;
 
 import munstead.ast.base;
+import munstead.core.exception;
+import munstead.core.util;
+import munstead.elf.files;
 import munstead.elf.sections;
 import munstead.elf.segments;
+import munstead.elf.strings;
 import std.conv: to;
 
 // Represents the ".interp" section
@@ -13,26 +17,12 @@ class ElfInterpSection(size_t nBits): ElfSection!nBits {
   string interpreter;
 
   // Parse the ".interp" section from the section table
-  static ElfInterpSection
-  parse(MemoryMap)(MemoryMap file, ElfSectionTableEntry!nBits shent) {
-    assert(shent !is null);
-    auto ret = new ElfInterpSection;
-    ret.initFromSectionTableEntry(file, shent);
-    ret.parse();
-    return ret;
-  }
+  void parse(ParseLocation parentLoc) {
+    auto fhdr = ancestor!(ElfFileHeader!nBits);
+    assert(fhdr !is null);
+    assert(bytes !is null);
 
-  // Parse the ".interp" section from the segment table
-  static ElfInterpSection
-  parse(MemoryMap)(MemoryMap file, ElfSegmentTableEntry!nBits phent) {
-    assert(phent !is null);
-    auto ret = new ElfInterpSection;
-    ret.initFromSegmentTableEntry(file, phent);
-    ret.parse();
-    return ret;
-  }
-
-  private void parse() {
-    interpreter = stringAt(0);
+    auto loc = sectionLocation(fhdr.formatName ~ " interp section", 0, parentLoc);
+    interpreter = bytes.stringAt(0, this, loc);
   }
 }

@@ -1,2 +1,7 @@
 *~
 *.o
+a.out
+libmunstead.a
+readelf
+readpe
+*.html

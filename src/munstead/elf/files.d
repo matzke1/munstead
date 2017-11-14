@@ -7,60 +7,52 @@ import munstead.core.byteorder;
 import munstead.core.exception;
 import munstead.core.interval;
 import munstead.core.mmap;
-import munstead.core.util: isEnumMember;
+import munstead.core.util;
 import munstead.core.wordtypes;
 import munstead.elf.dynamic;
 import munstead.elf.interp;
 import munstead.elf.notes;
+import munstead.elf.loader;
+import munstead.elf.reloc;
 import munstead.elf.sections;
 import munstead.elf.segments;
 import munstead.elf.strings;
 import munstead.elf.symbols;
 import munstead.elf.types;
-import std.algorithm: equal, filter;
+import std.algorithm: equal, filter, fold, map;
 import std.conv: to;
+import std.typecons: Tuple, tuple;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Base class for ELF files
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 class ElfFile: AsmFile {
   mixin AstNodeFeatures;
   struct AstChildren {}
-
-  static bool isElf(size_t nBits)(string fileName) {
-    auto map = new MemoryMap!(Word!nBits);
-    map.insertFile(fileName, 0);
-    try {
-      auto elf = new ElfFileHeader!nBits;
-      elf.parseHeader(map);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-    
-  static ElfFile parse(string fileName) {
-    if (isElf!32(fileName)) {
-      auto map = new MemoryMap!(Word!32);
-      map.insertFile(fileName, 0);
-      return ElfFileHeader!32.parse(map);
-    } else if (isElf!64(fileName)) {
-      auto map = new MemoryMap!(Word!64);
-      map.insertFile(fileName, 0);
-      return ElfFileHeader!64.parse(map);
-    } else {
-      return null;
-    }
-  }
 }
     
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// ELF file header
+////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
 class ElfFileHeader(size_t nBits): ElfFile {
   mixin AstNodeFeatures;
 
   struct AstChildren {
-    ElfSegmentTable!nBits segmentTable;
+    ElfSegmentTable!nBits segmentTable; // i.e., "program header table"
     ElfSectionTable!nBits sectionTable;
+
+    // All sections whether created because they belong to a section table, segment table, or other reason.
+    AstList!(ElfSection!nBits) sections;
+  }
+
+  static if (nBits == 32) {
+    enum formatName = "ELF32";
+  } else {
+    static assert(nBits == 64);
+    enum formatName = "ELF64";
   }
 
   enum FileClass: ubyte { ELFCLASSNONE = 0, ELFCLASS32 = 1, ELFCLASS64 = 2 };
@@ -287,41 +279,67 @@ class ElfFileHeader(size_t nBits): ElfFile {
     Elf!nBits.Half e_shstrndx;          // index of name section, or SHN_UNDEF or SHN_XINDEX
   }
 
-  Disk disk;
+  Disk disk;                             // file header disk format, in native byte order
+  MemoryMap!(Word!nBits) fileBytes;      // content of the entire file
+  MemoryMap!(Word!nBits) memBytes;       // memory mapping using preferred addresses
+  ElfSegmentLoader!nBits segmentLoader;  // loads segments into the memBytes map
+  ElfSectionLoader!nBits sectionLoader;  // loads sections on top of segments in the memBytes map
 
-  // Parse an ELF file
-  static ElfFileHeader
-  parse(MemoryMap)(MemoryMap file) {
-    auto ret = new ElfFileHeader;
-    ret.parseHeader(file);
-    ret.parseSegments(file);
-    ret.parseSections(file);
-    return ret;
+  this() {
+    sections = new AstList!(ElfSection!nBits);
   }
 
-  void parseHeader(MemoryMap)(MemoryMap file) {
-    assert(file !is null);
-    enum me = "ELF-" ~ to!string(nBits) ~ " file header";
+  // Before parsing, you must assign a map to the "fileBytes" member. This map should contain the file contents to be
+  // parsed starting at offset zero.
+  void parse(ParseLocation parentLoc) {
+    auto loc = fileLocation("", 0, parentLoc);
+    parseHeader(loc);
+    parseSegments(loc);
+    loadSegments();
+    parseSections(loc);
+    loadSections();
+    updatePermissions();
+    parseDynamic(loc);          // must be after segments and sections are mapped into virtual memory
+  }
+
+  // Alternative parsing method where the user supplies a file name.
+  void parseFile(string fileName) {
+    fileBytes = new MemoryMap!(Word!nBits);
+    fileBytes.insertFile(fileName, 0);
+    parse(null);
+  }
+
+  // True if the file looks like it's probably an ELF file
+  static bool testFile(string fileName) {
+    auto fhdr = ElfFileHeader.instance();
+    fhdr.fileBytes = new MemoryMap!(Word!nBits);
+    fhdr.fileBytes.insertFile(fileName, 0);
+    try {
+      auto loc = fhdr.fileLocation("", 0, null);
+      fhdr.parseHeader(loc);
+      return fhdr.preOrder.map!(node => node.errors.length).fold!"a+b"(0uL) == 0;
+    } catch {
+      return false;
+    }
+  }
+
+  // Parse just the ELF file header, nothing else
+  void parseHeader(ParseLocation parentLoc) {
+    auto loc = fileLocation(formatName ~ " header", 0, parentLoc);
 
     // Read the header
-    if (!file.readObjectAt(0, disk))
-      appendError(new SyntaxError(me ~ " short read", file.name, 0));
-
+    if (!fileBytes.readObjectAt(0, disk))
+      appendError(loc, "short read");
+    
     // Check magic number
     if (!disk.e_ident_magic[].equal([127, 'E', 'L', 'F']))
-      appendError(new SyntaxError("incorrect "~me~" e_ident_magic_number: " ~
-				  to!string(disk.e_ident_magic) ~
-				  " (expected [127, 'E', 'L', 'F'])",
-				  file.name, 0));
-
+      appendError(loc, "incorrect magic number (" ~ disk.e_ident_magic.to!string ~ ")");
+    
     // Check file class
     FileClass expectedFileClass = (32 == nBits ? FileClass.ELFCLASS32 : FileClass.ELFCLASS64);
     if (disk.e_ident_file_class != expectedFileClass)
-      appendError(new SyntaxError("incorrect "~me~" e_ident_file_class: " ~
-				  to!string(disk.e_ident_file_class) ~
-				  " (expected " ~ to!string(expectedFileClass) ~ ")",
-				  file.name, 0));
-
+      appendError(loc, "incorrect file class (" ~ disk.e_ident_file_class.to!string ~")");
+    
     // Decode file header
     switch (disk.e_ident_data_encoding) {
       case DataEncoding.ELFDATA2LSB:
@@ -333,226 +351,347 @@ class ElfFileHeader(size_t nBits): ElfFile {
         disk = fromBigEndian(disk);
         break;
       default:
-        appendError(new SyntaxError("incorrect "~me~" e_ident_data_encoding: " ~
-				    to!string(disk.e_ident_data_encoding) ~ " (expected 0 or 1)",
-				    file.name, 0));
+        appendError(loc, "incorrect data encoding (" ~ disk.e_ident_data_encoding.to!string ~ ")");
         break;
     }
 
     // Check ident stuff
     if (disk.e_ident_file_version != 1)
-      appendError(new SyntaxError("incorrect "~me~" e_ident_file_version: " ~
-				  to!string(disk.e_ident_file_version) ~ " (expected 1)",
-				  file.name, 0));
+      appendError(loc, "incorrect file version (" ~ disk.e_ident_file_version.to!string ~ ")");
 
     if (!isEnumMember!OsAbi(disk.e_ident_osabi))
-      appendError(new SyntaxError("unrecognized OS ABI (" ~ to!string(disk.e_ident_osabi) ~ ")", file.name, 0));
-
+      appendError(loc, "unrecognized OS ABI (" ~ disk.e_ident_osabi.to!string ~ ")");
+    
     if (disk.e_version != 0 && disk.e_version != 1)
-      appendError(new SyntaxError("incorrect "~me~" e_version: " ~ to!string(disk.e_version) ~ " (expected 0 or 1)",
-				  file.name, 0));
+      appendError(loc, "incorrect version (" ~ disk.e_version.to!string ~ ")");
   }
 
-  void parseSegments(MemoryMap)(MemoryMap file) {
-    parseSegmentTable(file);
-    createInterpSegments(file);
-    createNoteSegments(file);
-    createDynamicSegments(file);
-    createGenericSegments(file);
+  void parseSegments(ParseLocation parentLoc) {
+    auto loc = fileLocation(formatName ~ " segment (program header) table", disk.e_phoff, parentLoc);
+    parseSegmentTable(loc);
+    createInterpSegments(loc);
+    createNoteSegments(loc);
+    createDynamicSegments(loc);
+    createGenericSegments(loc);
   }
 
-  void parseSections(MemoryMap)(MemoryMap file) {
-    parseSectionTable(file);
-    createStringSections(file);
-    nameSectionTableEntries(file);
-    createInterpSections(file);
-    createSymbolSectionIndexSections(file);
-    createSymbolSections(file);
-    createNoteSections(file);
-    createDynamicSections(file);
-    createGenericSections(file);
+  // Create a loader (if the user hasn't already) and use it to load some segments into the memBytes map
+  void loadSegments() {
+    if (segmentLoader is null)
+      segmentLoader = new ElfSegmentLoader!nBits;
+    if (memBytes is null)
+      memBytes = new MemoryMap!(Word!nBits);
+    segmentLoader.loadSegments(memBytes, this);
+  }
+    
+  void parseSections(ParseLocation parentLoc) {
+    auto loc = fileLocation(formatName ~ " section table", disk.e_shoff, parentLoc);
+
+    // Preparation
+    parseSectionTable(loc);                      // parse the section table entries
+    createStringSections(loc);                   // many sections have strings, so build string tables early
+    nameSectionTableEntries(loc);                // names come from a string table
+
+    // Create sections
+    createRelocSections(loc);
+    createInterpSections(loc);
+    createSymbolSectionIndexSections(loc);
+    createSymbolSections(loc);
+    createNoteSections(loc);
+    createDynamicSections(loc);
+    createGenericSections(loc);
+
+    // sh_link and sh_info can be done now that all sections are created
+    setSectionLinkInfo(loc);
   }
 
+  // Create a loader (if the user hasn't already) and use it to load some sections into the memBytes map.
+  void loadSections() {
+    if (sectionLoader is null)
+      sectionLoader = new ElfSectionLoader!nBits;
+    assert(memBytes !is null);
+    sectionLoader.loadSections(memBytes, this);
+  }
+
+  // Re-precess the segment table to change permissions if necessary
+  void updatePermissions() {
+    if (segmentLoader is null)
+      segmentLoader = new ElfSegmentLoader!nBits;
+    assert(memBytes !is null);
+    segmentLoader.updatePermissions(memBytes, this);
+  }
+    
   // (Re)initializes the segmentTable by parsing it from the file.
-  void parseSegmentTable(MemoryMap)(MemoryMap file) {
-    if (disk.e_phoff > 0) {
-      segmentTable = ElfSegmentTable!nBits.parse!MemoryMap(file, this);
-    } else {
-      segmentTable = new ElfSegmentTable!nBits;
-    }
+  void parseSegmentTable(ParseLocation parentLoc) {
+    segmentTable = ElfSegmentTable!nBits.instance();
+    if (disk.e_phoff > 0)
+      segmentTable.parse(parentLoc);
   }
 
   // (Re)initializes the sectionTable by parsing it from the file.
-  void parseSectionTable(MemoryMap)(MemoryMap file) {
-    if (disk.e_shoff > 0) {
-      sectionTable = ElfSectionTable!nBits.parse!MemoryMap(file, this);
+  void parseSectionTable(ParseLocation parentLoc) {
+    sectionTable = ElfSectionTable!nBits.instance();
+    if (disk.e_shoff > 0)
+      sectionTable.parse(parentLoc);
+  }
+
+  // Find a section already registered for this file and having the same file and preferred memory extents
+  Section findExistingSection(Section)(Interval!(Word!nBits) fileExtent, Interval!(Word!nBits) memExtent)
+  if (is(Section : ElfSection!nBits)) {
+    foreach (section; sections[].map!(a => cast(Section) a).filter!"a !is null") {
+      if (fileExtent == section.fileExtent && memExtent == section.preferredExtent)
+        return section;
+    }
+    return null;
+  }
+      
+  // Find a section already registered for this file that would be appropriate for the specified program header, or else
+  // create such a section and register it.
+  void findOrCreateSection(Section)(ElfSegmentTableEntry!nBits phent, ParseLocation parentLoc)
+  if (is(Section : ElfSection!nBits)) {
+    assert(phent !is null);
+    assert(phent.section is null);
+
+    // Look for an existing section
+    if (auto found = findExistingSection!Section(phent.fileExtent, phent.preferredExtent)) {
+      phent.section = found;
     } else {
-      sectionTable = new ElfSectionTable!nBits;
+      // Or create and register a new one
+      auto created = Section.instance();
+      sections.pushBack(created);
+      created.createContent(phent);
+      created.parse(parentLoc);
+      phent.section = created;
     }
   }
 
-  // Creates the section holding the PT_INTERP segment.  This is likely duplicated by the ".interp" section.
-  void createInterpSegments(MemoryMap)(MemoryMap file) {
+  // Find a section already register for this file that would be appropriate for the specified section header, or else
+  // create such a section and register it.
+  void findOrCreateSection(Section)(ElfSectionTableEntry!nBits shent, ParseLocation parentLoc)
+  if (is(Section : ElfSection!nBits)) {
+    assert(shent !is null);
+    assert(shent.section is null);
+
+    // Look for existing section, and perhaps update some info (e.g., a section created from the ELF program header
+    // (segment) table won't have names, but the corresponding entry in the ELF section table probably will have a
+    // name).
+    if (auto found = findExistingSection!Section(shent.fileExtent, shent.preferredExtent)) {
+      if (found.name == "")
+        found.name = shent.name;
+      shent.section = found;
+    } else {
+      // Or create and register a new one
+      auto created = Section.instance();
+      shent.section = created;
+      sections.pushBack(created);
+      created.createContent(shent);
+      created.parse(parentLoc);
+    }
+  }
+    
+  // ElfInterpSection from PT_INTERP program headers
+  void createInterpSegments(ParseLocation parentLoc) {
     if (segmentTable !is null) {
       foreach (phent; segmentTable.entries[]) {
-	if (phent.disk.p_type == phent.SegmentType.PT_INTERP)
-	  phent.section = ElfInterpSection!nBits.parse!MemoryMap(file, phent);
+        if (phent.disk.p_type == phent.SegmentType.PT_INTERP)
+          findOrCreateSection!(ElfInterpSection!nBits)(phent, parentLoc);
       }
     }
   }
 
-  // Creates the section holding the .interp section. This section must be named ".interp".
-  void createInterpSections(MemoryMap)(MemoryMap file) {
+  // ElfInterpSection from named section headers
+  void createInterpSections(ParseLocation parentLoc) {
     if (sectionTable !is null) {
       foreach (shent; sectionTable.entries[]) {
-	if (shent.name == ".interp")
-	  shent.section = ElfInterpSection!nBits.parse!MemoryMap(file, shent);
-      }
-    }
-  }
-	
-  // Scan the sectionTable and find all sections that are string tables. For each table found, create a string section
-  // and add it to the section table entry.
-  void createStringSections(MemoryMap)(MemoryMap file) {
-    if (sectionTable !is null) {
-      foreach (shent; sectionTable.entries[]) {
-	if (shent.disk.sh_type == shent.SectionType.SHT_STRTAB)
-	  shent.section = ElfStringTable!nBits.parse!MemoryMap(file, shent);
+        if (shent.name == ".interp") {
+          findOrCreateSection!(ElfInterpSection!nBits)(shent, parentLoc);
+        }
       }
     }
   }
 
-  // Create symbol section-index tables
-  void createSymbolSectionIndexSections(MemoryMap)(MemoryMap file) {
+  // ElfStringTable from SHT_STRTAB section headers.
+  void createStringSections(ParseLocation parentLoc) {
     if (sectionTable !is null) {
       foreach (shent; sectionTable.entries[]) {
-	if (shent.disk.sh_type == shent.SectionType.SHT_SYMTAB_SHNDX)
-	  shent.section = ElfSymbolSectionIndexTable!nBits.parse!MemoryMap(file, this, shent);
-      }
-    }
-  }
-	
-  // Creates sections that are symbol tables
-  void createSymbolSections(MemoryMap)(MemoryMap file) {
-    if (sectionTable !is null) {
-      foreach (shent; sectionTable.entries[]) {
-	if (shent.disk.sh_type == shent.SectionType.SHT_SYMTAB || shent.disk.sh_type == shent.SectionType.SHT_DYNSYM)
-	  shent.section = ElfSymbolTable!nBits.parse!MemoryMap(file, this, shent);
+        if (shent.disk.sh_type == shent.SectionType.SHT_STRTAB)
+          findOrCreateSection!(ElfStringTable!nBits)(shent, parentLoc);
       }
     }
   }
 
-  void createNoteSections(MemoryMap)(MemoryMap file) {
+  // ElfSymbolSectionIndexTable from SHT_SYMTAB_SHNDX section headers
+  void createSymbolSectionIndexSections(ParseLocation parentLoc) {
     if (sectionTable !is null) {
       foreach (shent; sectionTable.entries[]) {
-	if (shent.disk.sh_type == shent.SectionType.SHT_NOTE)
-	  shent.section = ElfNoteSection!nBits.parse!MemoryMap(file, this, shent);
+        if (shent.disk.sh_type == shent.SectionType.SHT_SYMTAB_SHNDX)
+          findOrCreateSection!(ElfSymbolSectionIndexTable!nBits)(shent, parentLoc);
+      }
+    }
+  }
+        
+  // ElfSymbolTable from SHT_SYMTAB or SHT_DYNSYM section headers
+  void createSymbolSections(ParseLocation parentLoc) {
+    if (sectionTable !is null) {
+      foreach (shent; sectionTable.entries[]) {
+        if (shent.disk.sh_type == shent.SectionType.SHT_SYMTAB || shent.disk.sh_type == shent.SectionType.SHT_DYNSYM)
+          findOrCreateSection!(ElfSymbolTable!nBits)(shent, parentLoc);
       }
     }
   }
 
-  void createNoteSegments(MemoryMap)(MemoryMap file) {
+  // ElfNoteSection from SHT_NOTE section headers
+  void createNoteSections(ParseLocation parentLoc) {
+    if (sectionTable !is null) {
+      foreach (shent; sectionTable.entries[]) {
+        if (shent.disk.sh_type == shent.SectionType.SHT_NOTE)
+          findOrCreateSection!(ElfNoteSection!nBits)(shent, parentLoc);
+      }
+    }
+  }
+
+  // ElfNoteSection from PT_NOTE program headers
+  void createNoteSegments(ParseLocation parentLoc) {
     if (segmentTable !is null) {
       foreach (phent; segmentTable.entries[]) {
-	if (phent.disk.p_type == phent.SegmentType.PT_NOTE)
-	  phent.section = ElfNoteSection!nBits.parse!MemoryMap(file, this,phent);
+        if (phent.disk.p_type == phent.SegmentType.PT_NOTE)
+          findOrCreateSection!(ElfNoteSection!nBits)(phent, parentLoc);
       }
     }
   }
 
-  void createDynamicSections(MemoryMap)(MemoryMap file) {
+  // ElfRelocSection from SHT_REL and SHT_RELA section headers
+  void createRelocSections(ParseLocation parentLoc) {
     if (sectionTable !is null) {
       foreach (shent; sectionTable.entries[]) {
-	if (shent.disk.sh_type == shent.SectionType.SHT_DYNAMIC)
-	  shent.section = ElfDynamicSection!nBits.parse!MemoryMap(file, this, shent);
+        if (shent.disk.sh_type == shent.SectionType.SHT_REL) {
+          findOrCreateSection!(ElfRelocSection!(nBits, ElfRelocHasAddend.NO))(shent, parentLoc);
+        } else if (shent.disk.sh_type == shent.SectionType.SHT_RELA) {
+          findOrCreateSection!(ElfRelocSection!(nBits, ElfRelocHasAddend.YES))(shent, parentLoc);
+        }
       }
     }
   }
 
-  void createDynamicSegments(MemoryMap)(MemoryMap file) {
+  // ElfDynamicSection from SHT_DYNAMIC section headers
+  void createDynamicSections(ParseLocation parentLoc) {
+    if (sectionTable !is null) {
+      foreach (shent; sectionTable.entries[]) {
+        if (shent.disk.sh_type == shent.SectionType.SHT_DYNAMIC)
+          findOrCreateSection!(ElfDynamicSection!nBits)(shent, parentLoc);
+      }
+    }
+  }
+
+  // ElfDynamicSection from PT_DYNAMIC program headers
+  void createDynamicSegments(ParseLocation parentLoc) {
     if (segmentTable !is null) {
       foreach (phent; segmentTable.entries[]) {
-	if (phent.disk.p_type == phent.SegmentType.PT_DYNAMIC)
-	  phent.section = ElfDynamicSection!nBits.parse!MemoryMap(file, this,phent);
+        if (phent.disk.p_type == phent.SegmentType.PT_DYNAMIC)
+          findOrCreateSection!(ElfDynamicSection!nBits)(phent, parentLoc);
+      }
+    }
+  }
+
+  // Generic sections (ElfSection) for section headers still lacking a section object
+  void createGenericSections(ParseLocation parentLoc) {
+    if (sectionTable !is null) {
+      foreach (shent; sectionTable.entries[]) {
+        if (shent.section is null) {
+          auto section = ElfSection!nBits.instance();
+          shent.section = section;
+          sections.pushBack(section);
+          section.createContent(shent);
+        }
+      }
+    }
+  }
+
+  // Generic sections (ElfSection) for program headers still lacking a section object
+  void createGenericSegments(ParseLocation parentLoc) {
+    if (segmentTable !is null) {
+      foreach (phent; segmentTable.entries[]) {
+        if (phent.section is null) {
+          auto section = ElfSection!nBits.instance();
+          phent.section = section;
+          sections.pushBack(section);
+          section.createContent(phent);
+        }
       }
     }
   }
 
   // Now that string tables are parsed, we can use them to give names to the section table entries.
-  void nameSectionTableEntries(MemoryMap)(MemoryMap file) {
+  // "parentLoc" is already the "section table"
+  void nameSectionTableEntries(ParseLocation parentLoc) {
     if (sectionTable !is null && sectionTable.entries.length > 0) {
 
       // The file header e_shstrndx field usually holds the index for the section that serves as the section
       // table for the section entries, but if this is too high a value, the header stores SHN_XINDEX instead
       // and the true index is in the sh_link field of the first entry of the section table.
       auto section0 = sectionTable.entries[0];
+      auto section0Loc = indexParseLocation(formatName ~ " section table entry", 0, parentLoc);
       size_t stringSectionIdx = disk.e_shstrndx;
       if (disk.e_shstrndx == ElfSectionTable!nBits.SectionIndex.SHN_XINDEX) {
-	stringSectionIdx = section0.disk.sh_link;
+        stringSectionIdx = section0.disk.sh_link;
       } else if (section0.disk.sh_link > 0) {
-	appendError(new SyntaxError("ELF header e_shstrndx and section table entry #0 sh_link are incompatible",
-				    file.name, 0)); // FIXME: where?
+        appendError(section0Loc, "sh_link (" ~ section0.disk.sh_link.to!string ~ ")" ~
+                    " is incompatible with file header e_shstrndx (" ~ disk.e_shstrndx.to!string ~ ")");
       }
 
       ElfStringTable!nBits stringTable;
       if (stringSectionIdx >= sectionTable.entries.length) {
-	appendError(new SyntaxError("ELF section table's string table index (" ~ to!string(stringSectionIdx) ~ ") " ~
-				    "is invalid (must be less than " ~ to!string(sectionTable.entries.length) ~ ")",
-				    file.name, 0)); // FIXME: where?
+        appendError(parentLoc, "section table string table index (" ~ stringSectionIdx.to!string ~ ")" ~
+                    " is inconsistent with section table length (" ~ sectionTable.entries.length.to!string ~ " entries)");
       }
       if (stringSectionIdx > 0) { // 0 means no string section
-	stringTable = cast(ElfStringTable!nBits)(sectionTable.entries[stringSectionIdx].section);
-	if (stringTable is null) {
-	  appendError(new SyntaxError("ELF no string table at section entry #" ~ to!string(stringSectionIdx),
-				      file.name, 0)); // FIXME: where?
-	}
+        stringTable = cast(ElfStringTable!nBits)(sectionTable.entries[stringSectionIdx].section);
+        if (stringTable is null)
+          appendError(parentLoc, "string table index (" ~ stringSectionIdx.to!string ~ ") is not a string table");
       }
 
       // Now that we have a stringTable (or maybe null), use it to give names to all the section table entries
       foreach (shent; sectionTable.entries[]) {
-	if (shent.disk.sh_name > 0) {
-	  if (stringTable is null) {
-	    appendError(new SyntaxError("ELF section table entry has non-zero sh_name field, but not string table",
-					file.name, 0)); // FIXME: where?
-	  }
-	  shent.name = stringTable.stringAt(shent.disk.sh_name);
-	  if (shent.section !is null)
-	    shent.section.name = shent.name;
-	}
+        auto entryLoc = indexParseLocation(formatName ~ " section table entry", shent.index, parentLoc);
+        if (shent.disk.sh_name > 0) {
+          if (stringTable is null) {
+            appendError(entryLoc, "section table entry has non-zero sh_name (" ~ shent.disk.sh_name.to!string ~ ")" ~
+                        " but no string table");
+          }
+          shent.name = stringTable.stringAt(shent.disk.sh_name, shent, entryLoc);
+          if (shent.section !is null)
+            shent.section.name = shent.name;
+        }
       }
+    }
+  }
+
+  void setSectionLinkInfo(ParseLocation parentLoc) {
+    foreach (shent; sectionTable.entries[]) {
+      if (shent.section !is null)
+        shent.section.setLinkInfo(shent, parentLoc);
     }
   }
       
-  // Scan the section table and create generic section AST nodes for any table entry that doesn't have a section.
-  void createGenericSections(MemoryMap)(MemoryMap file) {
-    if (sectionTable !is null) {
-      foreach (shent; sectionTable.entries[]) {
-	if (shent.section is null) {
-	  auto section = new ElfSection!nBits;
-	  section.initFromSectionTableEntry(file, shent);
-	  shent.section = section;
-	}
-      }
-    }
+  // Finish parsing the dynamic sections after the memory map is created
+  void parseDynamic(ParseLocation parentLoc) {
+    assert(segmentTable !is null);
+    assert(memBytes !is null);
+
+    auto dynSections = segmentTable.entries[]
+      .map!(phent => cast(ElfDynamicSection!nBits) phent.section)
+      .filter!"a !is null";
+
+    foreach (dynsec; dynSections)
+      dynsec.parseMemory(parentLoc);
   }
 
-  // Scan the segment table and create generic sections for any table entries that don't have a section.
-  void createGenericSegments(MemoryMap)(MemoryMap file) {
-    if (segmentTable !is null) {
-      foreach (phent; segmentTable.entries[]) {
-	if (phent.section is null) {
-	  auto section = new ElfSection!nBits;
-	  section.initFromSegmentTableEntry(file, phent);
-	  phent.section = section;
-	}
-      }
-    }
-  }
-
-  // Find the range of segments that contain the specified section -- normally zero or one segments
+  // Return those program headers that completely enclose the specified section header's section in terms of preferred
+  // memory addresses. The return value is an input range.
   auto segmentsContainingSection(ElfSectionTableEntry!nBits shent) {
     assert(shent !is null);
     assert(segmentTable !is null);
+
     return segmentTable
       .entries[]
       .filter!(phent => !shent.preferredExtent.empty && phent.preferredExtent.contains(shent.preferredExtent));
@@ -566,5 +705,56 @@ class ElfFileHeader(size_t nBits): ElfFile {
       .entries[]
       .filter!(shent => !shent.preferredExtent.empty && phent.preferredExtent.contains(shent.preferredExtent));
   }
-}
 
+  // Returns the first registered section whose preferred mapping address is the specified address and which has the
+  // specified dynamic type. Returns null if none found.
+  Section sectionMappedAt(Section = ElfSection!nBits)(Word!nBits va)
+  if (is(Section : ElfSection!nBits)) {
+    foreach (section; sections[].map!(a => cast(Section) a).filter!"a !is null") {
+      if (!section.preferredExtent.empty && section.preferredExtent.least == va)
+        return section;
+    }
+    return null;
+  }
+
+  Tuple!(Section, "section", string, "error")
+  sectionByIndex(Section = ElfSection!nBits)(size_t idx) {
+    alias Found = Tuple!(Section, "section", string, "error");
+    Section section;
+    Exception error;
+
+    if (sectionTable is null)
+      return Found(section, "ELF file has no section table");
+    if (idx > sectionTable.entries.length) {
+      return Found(section,
+                   "section index (" ~ to!string(idx) ~ ")" ~
+                   " is out of range ([0, " ~ to!string(sectionTable.entries.length) ~ "])");
+    }
+
+    auto shent = sectionTable.entries[idx];
+    if (shent.disk.sh_type == ElfSectionTableEntry!nBits.SectionType.SHT_NULL)
+      return Found(section, "section index (" ~ to!string(idx) ~ ") points to an SHT_NULL entry");
+
+    if (shent.section is null)
+      return Found(section, "section index (" ~ to!string(idx) ~ ") has no section pointer");
+
+    section = cast(Section) shent.section;
+    if (section is null)
+      return Found(section, "section index (" ~ to!string(idx) ~ ") is not the right type" ~
+                   "(expected " ~ Section.stringof ~ " but is " ~ typeid(shent.section).stringof ~ ")");
+
+    return Found(section, "");
+  }
+
+  Section sectionByIndex(Section = ElfSection!nBits)(size_t idx, Ast errorNode, ParseLocation loc) {
+    auto found = sectionByIndex!Section(idx);
+    if (found.error != "")
+      errorNode.appendError(loc, found.error);
+    return found.section;
+  }
+
+  ParseLocation fileLocation(string what, Word!nBits offset, ParseLocation parent) {
+    auto global = Interval!(Word!nBits).whole;
+    return new MapParseLocation!(MemoryMap!(Word!nBits))(what, AddressSpace.FILE, fileBytes, global, offset, "", parent);
+  }
+}
